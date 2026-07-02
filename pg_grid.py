@@ -21,6 +21,8 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+from pg_quant import quantify_rectified, write_quant_outputs
+
 
 @dataclass
 class ChipRegion:
@@ -1148,13 +1150,25 @@ def process_image(
     write_image_unicode(output_dir / "roi_debug.jpg", roi_debug)
     write_measurements_csv(output_dir / "values.csv", records)
 
+    # PG-Quant V1.0：在定位结果上做逐单元定量与单元级质量标记。
+    # 旧输出（values.csv 等）全部保留，定量结果写入独立的 quant_* 文件。
+    quant_records, quant_meta = quantify_rectified(rectified, refined_points, grid_size)
+    quant_outputs = write_quant_outputs(output_dir, quant_records, quant_meta)
+
     result: dict[str, object] = {
-        "algorithm": "PG-Grid V1.4 OpenCV grid with lattice-consistency correction",
+        "algorithm": "PG-Grid V1.5 with PG-Quant V1.0 unit-level quantification",
         "image_path": str(image_path),
         "grid_size": int(grid_size),
         "point_count": int(len(refined_points)),
         "grid_points": grid_points,
         "lattice_consistency": lattice_info,
+        "quant_summary": {
+            "unit_count": quant_meta["unit_count"],
+            "reliable_count": quant_meta["summary"]["reliable_count"],
+            "reliable_ratio": quant_meta["summary"]["reliable_ratio"],
+            "illumination_model": quant_meta["illumination_model"],
+            "illumination_uniformity": quant_meta["illumination_uniformity"],
+        },
         "roi_radius": int(roi_radius),
         "rectified_size": int(rectified_size),
         "chip_region": {
@@ -1169,6 +1183,8 @@ def process_image(
             "roi_debug": str(output_dir / "roi_debug.jpg"),
             "values_csv": str(output_dir / "values.csv"),
             "result_json": str(output_dir / "result.json"),
+            "quant_values_csv": quant_outputs["quant_values_csv"],
+            "quant_result_json": quant_outputs["quant_result_json"],
         },
         "neural_detector_slot": {
             "enabled": False,
