@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from pathlib import Path
 
@@ -232,6 +233,40 @@ def test_fit_grid_points_10x10_does_not_degenerate_to_uniform_split():
     assert float(uniform_errors.mean()) > 30.0
 
 
+def test_fit_grid_points_10x10_handles_rotated_lattice():
+    """矫正残差导致点阵相对图像坐标轴有几度旋转时，拟合仍须贴合真实中心。
+
+    透视矫正只保证面板四角对齐；如果点阵与面板边缘存在装配旋转差，
+    或主区域检测的外接矩形略有偏差，矫正图中的晶格会带小角度旋转。
+    轴对齐的行列聚类在这种情况下会给出系统性偏差。
+    """
+    import cv2
+    from pg_grid import fit_grid_points
+
+    size = 800
+    angle = math.radians(3.0)
+    image = np.full((size, size, 3), 200, dtype=np.uint8)
+    center = size / 2.0
+    centers = []
+    for row in range(10):
+        for col in range(10):
+            base_x = 112.0 + col * 64.0 - center
+            base_y = 112.0 + row * 64.0 - center
+            cx = center + base_x * math.cos(angle) - base_y * math.sin(angle)
+            cy = center + base_x * math.sin(angle) + base_y * math.cos(angle)
+            x0 = int(round(cx - 12))
+            y0 = int(round(cy - 12))
+            image[y0:y0 + 24, x0:x0 + 24] = 90
+            centers.append((x0 + 11.5, y0 + 11.5))
+    centers = np.asarray(centers, dtype=np.float32)
+
+    fitted = fit_grid_points(image, grid_size=10)
+    errors = np.linalg.norm(fitted - centers, axis=1)
+
+    assert fitted.shape == (100, 2)
+    assert float(errors.mean()) < 3.0
+
+
 def test_refine_grid_points_resists_corner_blob_distractor():
     """10x10 局部精修不得被角落更暗的大块结构（如螺丝/阴影）拉偏。"""
     from pg_grid import refine_grid_points
@@ -245,6 +280,93 @@ def test_refine_grid_points_resists_corner_blob_distractor():
 
     assert abs(float(refined[0, 0]) - 50.0) <= 2.0
     assert abs(float(refined[0, 1]) - 50.0) <= 2.0
+
+
+def test_detect_chip_region_finds_large_rotated_panel():
+    """主区域检测必须能处理占近半幅面的旋转亮面板，而不是落入中央兜底框。"""
+    import cv2
+    from pg_grid import detect_chip_region, order_quad_points
+
+    image = np.full((900, 900, 3), 18, dtype=np.uint8)
+    rect = ((450.0, 450.0), (620.0, 620.0), -3.5)
+    box = cv2.boxPoints(rect).astype(np.int32)
+    cv2.fillConvexPoly(image, box, (214, 214, 214))
+
+    region = detect_chip_region(image)
+
+    assert region.method != "fallback_center"
+    # 检测四角应贴近真实面板四角。检测本身带 1.10 设计外扩
+    # （对角方向约 44px）加形态学膨胀数 px，因此容差取 60px；
+    # 若落入中央兜底框，角点误差会达到数百 px，断言仍有区分力。
+    expected = order_quad_points(box.astype(np.float32))
+    corner_errors = np.linalg.norm(region.points - expected, axis=1)
+    assert float(corner_errors.max()) < 60.0
+
+
+def _assert_bundled_example_localizes(tmp_path, image_name: str, grid_size: int, true_centers: np.ndarray, mean_error_limit: float):
+    """对仓库自带样例图跑完整 pipeline，并断言定位误差与输出完整性。"""
+    import cv2
+    from pg_grid import process_image
+
+    example_path = Path(__file__).resolve().parent.parent / "examples" / image_name
+    result = process_image(image_path=example_path, grid_size=grid_size, output_dir=tmp_path / "out")
+
+    assert result["chip_region"]["method"] != "fallback_center"
+    assert result["point_count"] == grid_size * grid_size
+    assert len(result["grid_points"]) == grid_size * grid_size
+
+    # 把原图坐标系的真值中心映射到矫正坐标系后逐点比较。
+    region = np.asarray(result["chip_region"]["points"], dtype=np.float32)
+    rect_size = int(result["rectified_size"])
+    dst = np.array(
+        [[0, 0], [rect_size - 1, 0], [rect_size - 1, rect_size - 1], [0, rect_size - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(region, dst)
+    true_rect = cv2.perspectiveTransform(true_centers.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+
+    predicted = np.asarray([[p["x"], p["y"]] for p in result["grid_points"]], dtype=np.float32)
+    errors = np.linalg.norm(predicted - true_rect, axis=1)
+    assert float(errors.mean()) < mean_error_limit
+
+
+def test_process_image_on_bundled_10x10_example(tmp_path):
+    """仓库自带 10x10 样例（旋转面板 + 细线干扰）必须被准确定位。"""
+    xs = np.linspace(210, 690, 10)
+    ys = np.linspace(210, 690, 10)
+    centers = []
+    for row, y in enumerate(ys):
+        for col, x in enumerate(xs):
+            # 与 examples/generate_synthetic_samples.py 中的抖动公式保持一致。
+            cx = round(x + (col % 3 - 1) * 1.5)
+            cy = round(y + (row % 3 - 1) * 1.2)
+            centers.append((float(cx), float(cy)))
+    _assert_bundled_example_localizes(
+        tmp_path,
+        "synthetic_10x10_dark_squares.png",
+        grid_size=10,
+        true_centers=np.asarray(centers, dtype=np.float32),
+        mean_error_limit=5.0,
+    )
+
+
+def test_process_image_on_bundled_15x15_example(tmp_path):
+    """仓库自带 15x15 亮点样例必须被准确定位。"""
+    xs = np.linspace(190, 810, 15)
+    ys = np.linspace(190, 810, 15)
+    centers = []
+    for row, y in enumerate(ys):
+        for col, x in enumerate(xs):
+            cx = round(x + (col % 4 - 1.5) * 0.8)
+            cy = round(y + (row % 4 - 1.5) * 0.8)
+            centers.append((float(cx), float(cy)))
+    _assert_bundled_example_localizes(
+        tmp_path,
+        "synthetic_15x15_bright_points.png",
+        grid_size=15,
+        true_centers=np.asarray(centers, dtype=np.float32),
+        mean_error_limit=5.0,
+    )
 
 
 def test_process_image_and_evaluation_end_to_end_10x10(tmp_path):
