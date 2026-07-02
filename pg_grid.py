@@ -1,6 +1,8 @@
 """PG-Grid：物理先验约束的规则阵列阵列定位与定量 demo。
 
-当前版本是 V1：OpenCV + 物理规则网格 + 局部微调。
+当前版本是 V1.4：OpenCV + 物理规则网格 + 局部微调 + 全局晶格一致性校正。
+局部精修之后会用鲁棒仿射晶格模型（见 enforce_lattice_consistency）把被
+细长暗线、局部阴影或高光拉偏的点吸附回规则晶格位置。
 后续如果要加入 MobileSAM/SAM2/轻量关键点网络，只需要替换
 `detect_chip_region()` 这一层，后面的透视矫正、网格生成、ROI 定量
 都可以复用。
@@ -117,61 +119,73 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
 
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 0)
 
     # 大面积黑背景会拉低整体亮度；成像视野圆环又会产生弱反光。
-    # 因此这里使用较高分位数，只保留 均匀背景下真正明亮的目标平面主体。
-    blurred = cv2.GaussianBlur(gray, (9, 9), 0)
+    # 高分位数阈值只保留均匀背景下真正明亮的目标平面主体，
+    # 但它隐含“目标只占整图一小部分”的假设：目标占比超过 6% 时，
+    # 94 分位会落到目标亮度内部，导致 mask 残缺。
     percentile_threshold = float(np.percentile(blurred, 94))
-    threshold = max(22.0, percentile_threshold)
-    mask = (blurred > threshold).astype(np.uint8) * 255
+    otsu_threshold, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 合并孔洞、流道、局部反光，但不要把圆形视野外圈也合进去。
+    # 两档尝试：
+    # 第一档沿用高分位阈值 + 20% 面积上限（真实成像视野图中目标约占 5%-12%，
+    # 大于 20% 的候选通常是成像视野圆环或暗箱反光区域），保证既有行为不变；
+    # 第二档仅在第一档无候选时启用：Otsu 阈值对“暗背景 + 大亮面板”类图像
+    # 能把阈值放到背景与面板之间，同时放宽面积上限以接受占近半幅面的目标。
+    attempts: list[tuple[float, float, str]] = [
+        (max(22.0, percentile_threshold), 0.20, "opencv_bright_region"),
+        (max(22.0, min(percentile_threshold, float(otsu_threshold))), 0.65, "opencv_bright_region_wide"),
+    ]
+
     kernel_size = max(7, int(min(width, height) * 0.008))
     if kernel_size % 2 == 0:
         kernel_size += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    mask = cv2.dilate(mask, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return _fallback_center_region(width, height)
-
     image_area = width * height
-    candidates: list[tuple[float, np.ndarray]] = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        # 真实目标平面主体在当前成像视野图中约占整图 5%-12%；
-        # 大于 20% 的候选通常是成像视野圆环或暗箱反光区域。
-        if area < image_area * 0.002 or area > image_area * 0.20:
+
+    for threshold, max_area_ratio, method in attempts:
+        mask = (blurred > threshold).astype(np.uint8) * 255
+
+        # 合并孔洞、流道、局部反光，但不要把圆形视野外圈也合进去。
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates: list[tuple[float, np.ndarray]] = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < image_area * 0.002 or area > image_area * max_area_ratio:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect = w / max(h, 1)
+            if not 0.35 <= aspect <= 2.8:
+                continue
+
+            rect_mask = np.zeros_like(gray, dtype=np.uint8)
+            cv2.drawContours(rect_mask, [contour], -1, 255, thickness=-1)
+            mean_brightness = cv2.mean(gray, mask=rect_mask)[0]
+            # 分数同时考虑面积和亮度，避免选到暗箱圆环反光。
+            score = math.sqrt(area) * (mean_brightness + 1.0)
+            candidates.append((score, contour))
+
+        if not candidates:
             continue
-        x, y, w, h = cv2.boundingRect(contour)
-        aspect = w / max(h, 1)
-        if not 0.35 <= aspect <= 2.8:
-            continue
 
-        rect_mask = np.zeros_like(gray, dtype=np.uint8)
-        cv2.drawContours(rect_mask, [contour], -1, 255, thickness=-1)
-        mean_brightness = cv2.mean(gray, mask=rect_mask)[0]
-        # 分数同时考虑面积和亮度，避免选到暗箱圆环反光。
-        score = math.sqrt(area) * (mean_brightness + 1.0)
-        candidates.append((score, contour))
+        _, best_contour = max(candidates, key=lambda item: item[0])
+        rect = cv2.minAreaRect(best_contour)
+        box = cv2.boxPoints(rect)
+        ordered = order_quad_points(box)
 
-    if not candidates:
-        return _fallback_center_region(width, height)
+        # 适度外扩，确保目标点和目标平面边缘不会被裁掉。
+        center = ordered.mean(axis=0)
+        expanded = center + (ordered - center) * 1.10
+        expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
+        expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
 
-    _, best_contour = max(candidates, key=lambda item: item[0])
-    rect = cv2.minAreaRect(best_contour)
-    box = cv2.boxPoints(rect)
-    ordered = order_quad_points(box)
+        return ChipRegion(points=order_quad_points(expanded), score=float(rect[1][0] * rect[1][1]), method=method)
 
-    # 适度外扩，确保目标点和目标平面边缘不会被裁掉。
-    center = ordered.mean(axis=0)
-    expanded = center + (ordered - center) * 1.10
-    expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
-    expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
-
-    return ChipRegion(points=order_quad_points(expanded), score=float(rect[1][0] * rect[1][1]), method="opencv_bright_region")
+    return _fallback_center_region(width, height)
 
 
 def _fallback_center_region(width: int, height: int) -> ChipRegion:
@@ -272,17 +286,31 @@ def _find_axis_centers(projection: np.ndarray, count: int, length: int, margin_r
     expected_pitch = (length * (1.0 - 2.0 * margin_ratio)) / max(count - 1, 1)
     min_distance = max(3.0, expected_pitch * 0.45)
 
+    # 多选一些峰而不是恰好 count 个：背景扣除会在面板边缘产生光晕过冲，
+    # 其投影峰可能比真实行列峰更强。若贪心恰好取 count 个，边缘假峰会把
+    # 真实行列挤出去，导致间距检查失败并退化为均分网格。
+    max_peaks = count + 8
     selected: list[float] = []
     for idx in order:
         if all(abs(float(idx) - existing) >= min_distance for existing in selected):
             selected.append(float(idx))
-            if len(selected) == count:
+            if len(selected) == max_peaks:
                 break
 
     if len(selected) < count:
         return None
 
-    centers = np.array(sorted(selected), dtype=np.float32)
+    # 优先用规则晶格子集选择：从候选峰中挑出最符合等间距直线模型的 count 个，
+    # 边缘光晕、流道等假峰因破坏规则性而被自然剔除。
+    peaks = sorted(selected)
+    peak_clusters = [(float(peak), float(smooth[int(round(peak))]), 1) for peak in peaks]
+    lattice_axis = _select_regular_axis_from_clusters(peak_clusters, count, length)
+    if lattice_axis is not None:
+        return lattice_axis.astype(np.float32)
+
+    # 规则子集选择失败（如网格位置超出其先验范围）时退回旧逻辑：
+    # 取最强的 count 个峰并检查间距均匀性。
+    centers = np.array(sorted(selected[:count]), dtype=np.float32)
     # 如果峰值间距过于不均匀，说明定位到了流道/边缘而非阵列点。
     if count > 2:
         diffs = np.diff(centers)
@@ -347,6 +375,117 @@ def _detect_dark_square_candidates(rectified: np.ndarray) -> np.ndarray:
     return np.asarray(candidates, dtype=np.float32)
 
 
+def _detect_bright_dot_candidates(rectified: np.ndarray) -> np.ndarray:
+    """定位 15x15 亮点阵列中的小亮斑候选点。
+
+    与 10x10 暗方块检测对偶：用顶帽变换（top-hat）增强“小而亮”的结构，
+    抑制面板亮度本身和大面积光照渐变，再用连通域几何过滤剔除
+    面板边缘亮带、高光条等非点状结构。
+
+    返回 N×3 数组：[x, y, weight]，weight 表示候选亮点的响应强度。
+    """
+
+    gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+    side = min(width, height)
+
+    # 核尺寸要大于亮点直径，顶帽变换才会保留整个亮点而不是只留边缘。
+    kernel_size = max(25, int(side * 0.050))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+
+    # Otsu 阈值只从内部区域估计：面板边缘的阶跃过渡在顶帽图中形成
+    # 远强于亮点的窄亮带，若参与全图 Otsu 统计，阈值会被抬到亮点响应
+    # 之上而导致全部漏检。阈值仍应用于全图，边缘行列的亮点照常分割。
+    interior = tophat[int(height * 0.10):int(height * 0.90), int(width * 0.10):int(width * 0.90)]
+    otsu_value, _ = cv2.threshold(interior, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, mask = cv2.threshold(tophat, float(otsu_value), 255, cv2.THRESH_BINARY)
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    # 亮点直径一般在矫正图边长的 0.8%-4.5% 之间；过大者多为高光带/边缘光晕。
+    min_box = max(5, int(side * 0.006))
+    max_box = max(16, int(side * 0.045))
+    min_area = max(20, int(side * side * 0.00004))
+    max_area = max(240, int(side * side * 0.00110))
+    edge_guard_x = width * 0.035
+    edge_guard_y = height * 0.035
+
+    candidates: list[tuple[float, float, float]] = []
+    for index in range(1, component_count):
+        x, y, w, h, area = stats[index]
+        aspect = w / max(h, 1)
+        cx, cy = centroids[index]
+
+        if not (min_area <= area <= max_area):
+            continue
+        if not (min_box <= w <= max_box and min_box <= h <= max_box):
+            continue
+        if not (0.45 <= aspect <= 1.80):
+            continue
+        if not (edge_guard_x <= cx <= width - edge_guard_x and edge_guard_y <= cy <= height - edge_guard_y):
+            continue
+
+        component_values = tophat[labels == index]
+        response = float(component_values.mean()) * math.sqrt(float(area))
+        candidates.append((float(cx), float(cy), response))
+
+    if not candidates:
+        return np.empty((0, 3), dtype=np.float32)
+    return np.asarray(candidates, dtype=np.float32)
+
+
+def _rotate_points(points: np.ndarray, angle_deg: float, center: tuple[float, float]) -> np.ndarray:
+    """绕给定中心旋转二维点集（角度制，图像坐标系）。"""
+
+    theta = math.radians(angle_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    cx, cy = center
+    shifted = np.asarray(points, dtype=np.float64) - (cx, cy)
+    rotated = np.empty_like(shifted)
+    rotated[:, 0] = shifted[:, 0] * cos_t - shifted[:, 1] * sin_t
+    rotated[:, 1] = shifted[:, 0] * sin_t + shifted[:, 1] * cos_t
+    return (rotated + (cx, cy)).astype(np.float32)
+
+
+def _histogram_sharpness(values: np.ndarray, length: float) -> float:
+    """一维坐标直方图的“锐度”。
+
+    规则晶格与坐标轴对齐时，行/列坐标聚成少数尖峰，平方和最大；
+    带旋转时坐标弥散到更多 bin，平方和降低。
+    """
+
+    bin_width = max(4.0, float(length) * 0.01)
+    bin_count = max(4, int(round(float(length) / bin_width)))
+    hist, _ = np.histogram(values, bins=bin_count, range=(0.0, float(length)))
+    return float(np.square(hist.astype(np.float64)).sum())
+
+
+def _estimate_lattice_rotation(points: np.ndarray, length: float, max_angle_deg: float = 6.0, step_deg: float = 0.25) -> float:
+    """估计候选点晶格相对图像坐标轴的小角度旋转。
+
+    透视矫正只对齐面板四角；点阵与面板边缘的装配旋转差、或主区域
+    外接矩形的角度偏差，都会让矫正图中的晶格残留几度旋转。
+    这里在 ±max_angle_deg 范围内扫描，找到让 x/y 直方图最锐利的角度，
+    返回“把晶格转正所需的旋转角”。
+    """
+
+    if points.shape[0] < 8:
+        return 0.0
+
+    center = (float(length) / 2.0, float(length) / 2.0)
+    best_angle = 0.0
+    best_score = -1.0
+    for angle in np.arange(-max_angle_deg, max_angle_deg + step_deg / 2.0, step_deg):
+        rotated = _rotate_points(points, float(angle), center)
+        score = _histogram_sharpness(rotated[:, 0], length) + _histogram_sharpness(rotated[:, 1], length)
+        if score > best_score:
+            best_score = score
+            best_angle = float(angle)
+    return best_angle
+
+
 def _cluster_axis_candidates(values: np.ndarray, weights: np.ndarray, length: int) -> list[tuple[float, float, int]]:
     """把候选点在单个坐标轴上聚成若干中心簇。
 
@@ -398,13 +537,30 @@ def _select_regular_axis_from_clusters(
     if len(clusters) < count:
         return None
 
+    # 防组合爆炸：螺丝、边缘碎片可能产生大量杂散簇，簇数一多，
+    # C(N, count) 会迅速失控（例如 C(24,10) 约 200 万组合，实测需要一分钟以上）。
+    # 真实阵列的行/列簇有约 grid_size 个成员、支持度远高于孤立误检，
+    # 因此按支持度只保留最强的若干簇即可，同时必须恢复位置升序，
+    # 因为下面的直线拟合假定组合内的中心是按坐标递增排列的。
+    # 上限随 count 自适应：至少给 count 留 4 个假峰余量（边缘光晕可能比真实
+    # 行列峰更强，固定上限会把弱的真实行列挤掉），组合数上界约为
+    # C(count+4, 4)，count=10 时为 C(16,10)=8008，count=15 时为 C(19,15)=3876。
+    max_clusters = max(16, count + 4)
+    if len(clusters) > max_clusters:
+        strongest = sorted(clusters, key=lambda item: item[1], reverse=True)[:max_clusters]
+        clusters = sorted(strongest, key=lambda item: item[0])
+
     best: tuple[float, np.ndarray] | None = None
     index_axis = np.arange(count, dtype=np.float32)
     min_pitch = length * 0.045
     max_pitch = length * 0.095
-    min_start = length * 0.080
-    max_start = length * 0.250
-    max_end = length * 0.930
+    # 起止范围只做弱约束（距边缘至少 5%）：主区域检测的外扩比例和形态学
+    # 膨胀会让阵列在矫正图中的位置有 ±3% 左右浮动，过紧的范围会把
+    # 合法网格误拒并退化为均分网格。假峰主要靠下面的规则性残差
+    # 和支持度评分剔除，而不是靠位置范围。
+    min_start = length * 0.050
+    max_start = length * 0.300
+    max_end = length * 0.950
 
     for combo in combinations(clusters, count):
         centers = np.asarray([item[0] for item in combo], dtype=np.float32)
@@ -436,23 +592,54 @@ def _select_regular_axis_from_clusters(
     return best[1]
 
 
-def _fit_dark_square_grid(rectified: np.ndarray, grid_size: int) -> np.ndarray | None:
-    """用暗方块候选点拟合 10x10 规则网格。"""
+def _fit_lattice_from_candidates(candidates: np.ndarray, grid_size: int, width: int, height: int) -> np.ndarray | None:
+    """从候选点拟合带旋转补偿的规则晶格。
 
-    height, width = rectified.shape[:2]
-    candidates = _detect_dark_square_candidates(rectified)
+    步骤：
+    1. 估计候选点晶格相对坐标轴的小角度旋转（矫正残差）；
+    2. 把候选点旋到与坐标轴对齐后，做行/列聚类和规则等距轴选择；
+    3. 由行列中心外积生成网格，再旋回原坐标系。
+
+    轴对齐假设一旦成立，螺丝、边框碎片等误检会因为不满足规则间距
+    或支持度不足而被 _select_regular_axis_from_clusters 剔除。
+    """
+
     if candidates.shape[0] < grid_size * 4:
         return None
 
+    length = min(width, height)
+    center = (float(length) / 2.0, float(length) / 2.0)
+    angle = _estimate_lattice_rotation(candidates[:, :2], length)
+    aligned = _rotate_points(candidates[:, :2], angle, center)
+
     weights = candidates[:, 2]
-    x_clusters = _cluster_axis_candidates(candidates[:, 0], weights, width)
-    y_clusters = _cluster_axis_candidates(candidates[:, 1], weights, height)
+    x_clusters = _cluster_axis_candidates(aligned[:, 0], weights, width)
+    y_clusters = _cluster_axis_candidates(aligned[:, 1], weights, height)
     xs = _select_regular_axis_from_clusters(x_clusters, grid_size, width)
     ys = _select_regular_axis_from_clusters(y_clusters, grid_size, height)
 
     if xs is None or ys is None:
         return None
-    return np.array([[x, y] for y in ys for x in xs], dtype=np.float32)
+
+    grid = np.array([[x, y] for y in ys for x in xs], dtype=np.float32)
+    # 反向旋转，把轴对齐坐标系中的网格映射回矫正图坐标。
+    return _rotate_points(grid, -angle, center)
+
+
+def _fit_dark_square_grid(rectified: np.ndarray, grid_size: int) -> np.ndarray | None:
+    """用暗方块候选点拟合 10x10 规则网格。"""
+
+    height, width = rectified.shape[:2]
+    candidates = _detect_dark_square_candidates(rectified)
+    return _fit_lattice_from_candidates(candidates, grid_size, width, height)
+
+
+def _fit_bright_dot_grid(rectified: np.ndarray, grid_size: int) -> np.ndarray | None:
+    """用亮点候选点拟合 15x15 规则网格。"""
+
+    height, width = rectified.shape[:2]
+    candidates = _detect_bright_dot_candidates(rectified)
+    return _fit_lattice_from_candidates(candidates, grid_size, width, height)
 
 
 def _refine_one_10x10_dark_square_center(
@@ -545,6 +732,13 @@ def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float =
             return dark_square_grid
 
     if grid_size >= 15:
+        # 亮点候选路径可以处理晶格相对坐标轴的小角度旋转；
+        # 候选不足或规则性不满足时，仍走下面的投影路径。
+        bright_dot_grid = _fit_bright_dot_grid(rectified, grid_size)
+        if bright_dot_grid is not None:
+            return bright_dot_grid
+
+    if grid_size >= 15:
         # 15x15 亮点：明亮点位是目标。
         energy = gray.astype(np.float32)
     else:
@@ -618,6 +812,115 @@ def refine_grid_points(rectified: np.ndarray, points: np.ndarray, grid_size: int
             refined[idx] = (cx, cy)
 
     return refined
+
+
+def enforce_lattice_consistency(
+    points: np.ndarray,
+    grid_size: int,
+    inlier_threshold_ratio: float = 0.18,
+    min_threshold_px: float = 2.5,
+    max_iterations: int = 5,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """用全局规则晶格约束修正被局部干扰拉偏的点位。
+
+    物理先验：阵列点位构成刚性规则晶格，矫正残差只会表现为整体的
+    仿射变形（平移/缩放/旋转/轻微剪切），单个点不应独立漂移。
+    因此这里把 (row, col) -> (x, y) 拟合为仿射晶格模型：
+
+        x = a0 + a1*col + a2*row
+        y = b0 + b1*col + b2*row
+
+    并做“阈值化迭代重拟合”：残差明显超出阈值的点视为被细长暗线、
+    局部阴影、高光或边缘结构拉偏的异常点，剔除后重拟合；收敛后把
+    异常点吸附回模型预测位置，其余点保留局部精修结果（允许真实的
+    小幅制造/透视残差，不强行摆到完美晶格上）。
+
+    阈值取 max(min_threshold_px, inlier_threshold_ratio * pitch)：
+    - 0.18 * pitch 略小于局部精修允许的最大位移（约 0.21-0.23 pitch），
+      刚好能抓住“被精修拉到窗口极限”的点；
+    - 正常制造与透视残差通常小于 0.05 pitch，不会被误伤；
+    - min_threshold_px 防止小间距网格下阈值低于像素量化噪声。
+
+    返回 (修正后的点, 诊断信息)。诊断信息全部为原生类型，可直接写入 JSON。
+    """
+
+    points = np.asarray(points, dtype=np.float32)
+    expected_count = grid_size * grid_size
+    info: dict[str, object] = {
+        "applied": False,
+        "reason": "",
+        "outlier_count": 0,
+        "corrected_points": [],
+        "pitch_px": 0.0,
+        "threshold_px": 0.0,
+        "inlier_rmse_px": 0.0,
+    }
+
+    # 网格太小时异常点无法与整体变形区分，点数不符说明上游异常，都不做修正。
+    if grid_size < 3:
+        info["reason"] = "grid_size 小于 3，晶格约束不可靠"
+        return points.copy(), info
+    if points.shape[0] != expected_count:
+        info["reason"] = f"点数 {points.shape[0]} 与 {grid_size}x{grid_size} 不符"
+        return points.copy(), info
+
+    indices = np.arange(expected_count)
+    rows = (indices // grid_size).astype(np.float64)
+    cols = (indices % grid_size).astype(np.float64)
+    design = np.stack([np.ones(expected_count), cols, rows], axis=1)
+    xy = points.astype(np.float64)
+
+    inliers = np.ones(expected_count, dtype=bool)
+    predicted = xy.copy()
+    threshold = float(min_threshold_px)
+    pitch = 0.0
+
+    for _ in range(max_iterations):
+        coefficients, _, _, _ = np.linalg.lstsq(design[inliers], xy[inliers], rcond=None)
+        predicted = design @ coefficients
+        residual = np.linalg.norm(xy - predicted, axis=1)
+
+        # 由模型系数直接估计间距：列方向步长向量 (a1, b1)、行方向步长向量 (a2, b2)。
+        pitch_col = math.hypot(coefficients[1, 0], coefficients[1, 1])
+        pitch_row = math.hypot(coefficients[2, 0], coefficients[2, 1])
+        pitch = (pitch_col + pitch_row) / 2.0
+        threshold = max(float(min_threshold_px), pitch * inlier_threshold_ratio)
+
+        new_inliers = residual <= threshold
+        # 保护：inlier 太少说明整体拟合已不可信（如上游整片错位），
+        # 此时宁可不动，也不能把大量点吸附到错误模型上。
+        if int(new_inliers.sum()) < max(6, expected_count // 2):
+            info["reason"] = "晶格模型 inlier 不足，跳过修正"
+            return points.copy(), info
+        if np.array_equal(new_inliers, inliers):
+            inliers = new_inliers
+            break
+        inliers = new_inliers
+
+    corrected = points.copy()
+    outlier_indices = np.flatnonzero(~inliers)
+    corrected[outlier_indices] = predicted[outlier_indices].astype(np.float32)
+
+    inlier_residual = np.linalg.norm(xy[inliers] - predicted[inliers], axis=1)
+    info.update(
+        {
+            "applied": True,
+            "reason": "ok",
+            "outlier_count": int(outlier_indices.size),
+            "corrected_points": [
+                {
+                    "row": int(index // grid_size),
+                    "col": int(index % grid_size),
+                    "shift_px": round(float(np.linalg.norm(xy[index] - predicted[index])), 4),
+                }
+                for index in outlier_indices
+            ],
+            "pitch_px": round(float(pitch), 4),
+            "threshold_px": round(float(threshold), 4),
+            "inlier_rmse_px": round(float(np.sqrt(np.mean(inlier_residual**2))), 6) if inlier_residual.size else 0.0,
+        }
+    )
+    return corrected, info
 
 
 def extract_roi_measurements(
@@ -821,6 +1124,9 @@ def process_image(
     pitch = (rectified_size * (1.0 - 2.0 * config.margin_ratio)) / max(grid_size - 1, 1)
     roi_radius = max(3, int(round(pitch * config.roi_radius_ratio)))
     refined_points = refine_grid_points(rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32)))
+    # 局部精修可能被细长暗线、阴影或高光拉偏个别点；
+    # 最后用全局规则晶格约束把明显偏离的点吸附回晶格模型位置。
+    refined_points, lattice_info = enforce_lattice_consistency(refined_points, grid_size)
 
     records = extract_roi_measurements(rectified, refined_points, grid_size=grid_size, roi_radius=roi_radius)
     quality = evaluate_quality(original, rectified, records)
@@ -843,11 +1149,12 @@ def process_image(
     write_measurements_csv(output_dir / "values.csv", records)
 
     result: dict[str, object] = {
-        "algorithm": "PG-Grid V1.3 OpenCV grid with localization-evaluation support",
+        "algorithm": "PG-Grid V1.4 OpenCV grid with lattice-consistency correction",
         "image_path": str(image_path),
         "grid_size": int(grid_size),
         "point_count": int(len(refined_points)),
         "grid_points": grid_points,
+        "lattice_consistency": lattice_info,
         "roi_radius": int(roi_radius),
         "rectified_size": int(rectified_size),
         "chip_region": {
