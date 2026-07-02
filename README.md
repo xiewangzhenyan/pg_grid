@@ -34,7 +34,30 @@ pip install -r requirements.txt
 python -m pytest tests -v
 ```
 
-Run one image:
+The repository includes two neutral synthetic sample images:
+
+- `examples/synthetic_10x10_dark_squares.png`
+- `examples/synthetic_15x15_bright_points.png`
+
+You can regenerate them with:
+
+```powershell
+python examples/generate_synthetic_samples.py
+```
+
+Run the included 10x10 sample:
+
+```powershell
+python pg_grid_demo.py --image examples/synthetic_10x10_dark_squares.png --grid 10 --output outputs/synthetic_10x10
+```
+
+Run the included 15x15 sample:
+
+```powershell
+python pg_grid_demo.py --image examples/synthetic_15x15_bright_points.png --grid 15 --output outputs/synthetic_15x15
+```
+
+Run another image:
 
 ```powershell
 python pg_grid_demo.py --image "path/to/image.jpg" --grid 10 --output outputs/sample_10x10
