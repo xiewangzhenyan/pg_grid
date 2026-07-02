@@ -369,6 +369,124 @@ def test_process_image_on_bundled_15x15_example(tmp_path):
     )
 
 
+def _make_projective_10x10(gx: float = 3.5e-5, gy: float = 3.5e-5, shear: float = 0.02):
+    """构造中心带透视畸变的 10x10 暗方块矫正图。
+
+    真值点位由 仿射晶格 + 单应透视项 生成：透视分量是仿射模型
+    无法表达的系统性弯曲，用于验证光束法平差的必要性。
+    返回 (图像, 真值中心)。
+    """
+    image = np.full((800, 800, 3), 200, dtype=np.uint8)
+    centers = []
+    for row in range(10):
+        for col in range(10):
+            x0 = 112.0 + 64.0 * col + shear * (112.0 + 64.0 * row)
+            y0 = 112.0 + 64.0 * row
+            w = 1.0 + gx * (x0 - 400.0) + gy * (y0 - 400.0)
+            cx, cy = x0 / w, y0 / w
+            x_lo = int(round(cx - 12))
+            y_lo = int(round(cy - 12))
+            image[y_lo:y_lo + 24, x_lo:x_lo + 24] = 90
+            centers.append((x_lo + 11.5, y_lo + 11.5))
+    return image, np.asarray(centers, dtype=np.float32)
+
+
+def test_bundle_adjust_recovers_perspective_distorted_lattice():
+    """光束法平差必须恢复带透视残差的晶格；仿射模型对该场景有系统性残差。"""
+    from pg_grid import bundle_adjust_lattice, fit_grid_points
+
+    image, truth = _make_projective_10x10()
+    initial = fit_grid_points(image, grid_size=10)
+    adjusted, info, point_meta = bundle_adjust_lattice(image, initial, grid_size=10)
+
+    errors = np.linalg.norm(adjusted - truth, axis=1)
+    assert adjusted.shape == (100, 2)
+    assert len(point_meta) == 100
+    assert info["applied"] is True
+    assert info["model"] == "homography"
+    assert float(errors.mean()) < 1.0
+
+    # 对照：仿射晶格模型对同一真值的最优拟合仍留下明显系统残差，
+    # 证明升级到单应模型是必要的而不是锦上添花。
+    indices = np.arange(100)
+    design = np.stack([np.ones(100), indices % 10, indices // 10], axis=1)
+    affine_coef, _, _, _ = np.linalg.lstsq(design, truth.astype(np.float64), rcond=None)
+    affine_residual = np.linalg.norm(truth - design @ affine_coef, axis=1)
+    assert float(affine_residual.mean()) > 1.8
+
+
+def test_bundle_adjust_marks_occluded_units_imputed_but_accurate():
+    """被抹除的单元必须标记为模型补位（imputed），且补位坐标仍贴近真实晶格。"""
+    from pg_grid import bundle_adjust_lattice, fit_grid_points
+
+    image, truth = _make_synthetic_rectified_10x10()
+    erased = [2 * 10 + 3, 5 * 10 + 5, 8 * 10 + 1]
+    for idx in erased:
+        cx, cy = truth[idx]
+        x_lo, y_lo = int(round(cx - 14)), int(round(cy - 14))
+        image[y_lo:y_lo + 28, x_lo:x_lo + 28] = 200
+
+    initial = fit_grid_points(image, grid_size=10)
+    adjusted, info, point_meta = bundle_adjust_lattice(image, initial, grid_size=10)
+
+    for idx in erased:
+        assert point_meta[idx]["source"] == "model_imputed", idx
+        assert "imputed_position" in point_meta[idx]["flags"]
+        assert float(np.linalg.norm(adjusted[idx] - truth[idx])) < 3.0
+
+    supported = [m for i, m in enumerate(point_meta) if i not in erased]
+    refined_count = sum(1 for m in supported if m["source"] == "candidate_refined")
+    assert refined_count >= 90
+    assert info["candidate_support_ratio"] >= 0.9
+    assert info["trusted"] is True
+
+
+def test_bundle_adjust_rejects_grid_without_image_evidence():
+    """空白图像上的均分网格没有任何候选支撑，必须被判定为不可信而非静默通过。"""
+    from pg_grid import bundle_adjust_lattice, generate_grid_points
+
+    image = np.full((800, 800, 3), 200, dtype=np.uint8)
+    points = generate_grid_points(10, 800, 800, margin_ratio=0.085)
+
+    adjusted, info, point_meta = bundle_adjust_lattice(image, points, grid_size=10)
+
+    assert info["trusted"] is False
+    assert float(info["candidate_support_ratio"]) == 0.0
+    # 无证据时不得虚构调整：坐标原样返回，点数不变。
+    assert adjusted.shape == (100, 2)
+    assert np.allclose(adjusted, points, atol=1e-3)
+
+
+def test_process_image_grid_points_carry_confidence_source_flags(tmp_path):
+    """result.json 的每个 grid_point 必须携带 confidence/source/flags 增量字段。"""
+    from pg_grid import process_image
+
+    example = Path(__file__).resolve().parent.parent / "examples" / "synthetic_10x10_dark_squares.png"
+    result = process_image(image_path=example, grid_size=10, output_dir=tmp_path)
+
+    points = result["grid_points"]
+    assert len(points) == 100
+    refined_count = 0
+    for point in points:
+        # 旧字段完整保留
+        assert set(["row", "col", "x", "y"]).issubset(point.keys())
+        assert 0.0 <= float(point["confidence"]) <= 1.0
+        assert point["source"] in ("candidate_refined", "model_imputed", "unadjusted")
+        assert isinstance(point["flags"], list)
+        if point["source"] == "candidate_refined":
+            refined_count += 1
+    assert refined_count >= 90
+
+    lattice = result["lattice_consistency"]
+    assert lattice["model"] == "homography"
+    # 样例图带细线干扰：与线粘连的方块会被全图候选检测的严格过滤排除
+    # （局部精修仍能找到它们），支撑率断言按"绝大多数有证据"校准为 0.8，
+    # 高于 trusted 阈值 0.6。
+    assert float(lattice["candidate_support_ratio"]) >= 0.8
+    assert lattice["trusted"] is True
+    assert "reasons" in result["quality"]
+
+
 def test_process_image_and_evaluation_end_to_end_10x10(tmp_path):
     """端到端：完整 pipeline 定位偏移网格 + 评价工具消费 result.json。
 

@@ -31,6 +31,34 @@ def test_compute_localization_metrics_reports_known_offsets():
     assert metrics["pass_ratio_5px"] == pytest.approx(1.0)
 
 
+def test_localization_metrics_include_pitch_normalized_errors():
+    """评估指标必须给出按网格间距归一的误差，使不同规格/分辨率可比。"""
+    from pg_grid_eval import compute_localization_errors
+
+    reference = [
+        {"row": 0, "col": 0, "x": 20.0, "y": 20.0},
+        {"row": 0, "col": 1, "x": 60.0, "y": 20.0},
+        {"row": 1, "col": 0, "x": 20.0, "y": 60.0},
+        {"row": 1, "col": 1, "x": 60.0, "y": 60.0},
+    ]
+    predicted = [
+        {"row": 0, "col": 0, "x": 23.0, "y": 24.0},
+        {"row": 0, "col": 1, "x": 60.0, "y": 20.0},
+        {"row": 1, "col": 0, "x": 20.0, "y": 60.0},
+        {"row": 1, "col": 1, "x": 60.0, "y": 60.0},
+    ]
+
+    errors, metrics = compute_localization_errors(reference, predicted, grid_size=2)
+
+    # 参考点间距 40px，首点误差 5px = 12.5% pitch。
+    assert metrics["pitch_px"] == pytest.approx(40.0)
+    assert metrics["mean_error_pct_pitch"] == pytest.approx(3.125)
+    assert metrics["max_error_pct_pitch"] == pytest.approx(12.5)
+    assert metrics["pass_ratio_5pct_pitch"] == pytest.approx(0.75)
+    assert errors[0]["error_pct_pitch"] == pytest.approx(12.5)
+    assert errors[1]["error_pct_pitch"] == pytest.approx(0.0)
+
+
 def test_write_evaluation_report_creates_json_csv_and_overlay(tmp_path):
     """验证评价报告写出：必须生成指标 JSON、逐点 CSV 和误差叠图。"""
     from pg_grid import write_image_unicode
