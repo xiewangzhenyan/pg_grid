@@ -1,6 +1,8 @@
 """PG-Grid：物理先验约束的规则阵列阵列定位与定量 demo。
 
-当前版本是 V1：OpenCV + 物理规则网格 + 局部微调。
+当前版本是 V1.4：OpenCV + 物理规则网格 + 局部微调 + 全局晶格一致性校正。
+局部精修之后会用鲁棒仿射晶格模型（见 enforce_lattice_consistency）把被
+细长暗线、局部阴影或高光拉偏的点吸附回规则晶格位置。
 后续如果要加入 MobileSAM/SAM2/轻量关键点网络，只需要替换
 `detect_chip_region()` 这一层，后面的透视矫正、网格生成、ROI 定量
 都可以复用。
@@ -398,6 +400,16 @@ def _select_regular_axis_from_clusters(
     if len(clusters) < count:
         return None
 
+    # 防组合爆炸：螺丝、边缘碎片可能产生大量杂散簇，簇数一多，
+    # C(N, count) 会迅速失控（例如 C(24,10) 约 200 万组合，实测需要一分钟以上）。
+    # 真实阵列的行/列簇有约 grid_size 个成员、支持度远高于孤立误检，
+    # 因此按支持度只保留最强的若干簇即可，同时必须恢复位置升序，
+    # 因为下面的直线拟合假定组合内的中心是按坐标递增排列的。
+    max_clusters = 16
+    if len(clusters) > max_clusters:
+        strongest = sorted(clusters, key=lambda item: item[1], reverse=True)[:max_clusters]
+        clusters = sorted(strongest, key=lambda item: item[0])
+
     best: tuple[float, np.ndarray] | None = None
     index_axis = np.arange(count, dtype=np.float32)
     min_pitch = length * 0.045
@@ -620,6 +632,115 @@ def refine_grid_points(rectified: np.ndarray, points: np.ndarray, grid_size: int
     return refined
 
 
+def enforce_lattice_consistency(
+    points: np.ndarray,
+    grid_size: int,
+    inlier_threshold_ratio: float = 0.18,
+    min_threshold_px: float = 2.5,
+    max_iterations: int = 5,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """用全局规则晶格约束修正被局部干扰拉偏的点位。
+
+    物理先验：阵列点位构成刚性规则晶格，矫正残差只会表现为整体的
+    仿射变形（平移/缩放/旋转/轻微剪切），单个点不应独立漂移。
+    因此这里把 (row, col) -> (x, y) 拟合为仿射晶格模型：
+
+        x = a0 + a1*col + a2*row
+        y = b0 + b1*col + b2*row
+
+    并做“阈值化迭代重拟合”：残差明显超出阈值的点视为被细长暗线、
+    局部阴影、高光或边缘结构拉偏的异常点，剔除后重拟合；收敛后把
+    异常点吸附回模型预测位置，其余点保留局部精修结果（允许真实的
+    小幅制造/透视残差，不强行摆到完美晶格上）。
+
+    阈值取 max(min_threshold_px, inlier_threshold_ratio * pitch)：
+    - 0.18 * pitch 略小于局部精修允许的最大位移（约 0.21-0.23 pitch），
+      刚好能抓住“被精修拉到窗口极限”的点；
+    - 正常制造与透视残差通常小于 0.05 pitch，不会被误伤；
+    - min_threshold_px 防止小间距网格下阈值低于像素量化噪声。
+
+    返回 (修正后的点, 诊断信息)。诊断信息全部为原生类型，可直接写入 JSON。
+    """
+
+    points = np.asarray(points, dtype=np.float32)
+    expected_count = grid_size * grid_size
+    info: dict[str, object] = {
+        "applied": False,
+        "reason": "",
+        "outlier_count": 0,
+        "corrected_points": [],
+        "pitch_px": 0.0,
+        "threshold_px": 0.0,
+        "inlier_rmse_px": 0.0,
+    }
+
+    # 网格太小时异常点无法与整体变形区分，点数不符说明上游异常，都不做修正。
+    if grid_size < 3:
+        info["reason"] = "grid_size 小于 3，晶格约束不可靠"
+        return points.copy(), info
+    if points.shape[0] != expected_count:
+        info["reason"] = f"点数 {points.shape[0]} 与 {grid_size}x{grid_size} 不符"
+        return points.copy(), info
+
+    indices = np.arange(expected_count)
+    rows = (indices // grid_size).astype(np.float64)
+    cols = (indices % grid_size).astype(np.float64)
+    design = np.stack([np.ones(expected_count), cols, rows], axis=1)
+    xy = points.astype(np.float64)
+
+    inliers = np.ones(expected_count, dtype=bool)
+    predicted = xy.copy()
+    threshold = float(min_threshold_px)
+    pitch = 0.0
+
+    for _ in range(max_iterations):
+        coefficients, _, _, _ = np.linalg.lstsq(design[inliers], xy[inliers], rcond=None)
+        predicted = design @ coefficients
+        residual = np.linalg.norm(xy - predicted, axis=1)
+
+        # 由模型系数直接估计间距：列方向步长向量 (a1, b1)、行方向步长向量 (a2, b2)。
+        pitch_col = math.hypot(coefficients[1, 0], coefficients[1, 1])
+        pitch_row = math.hypot(coefficients[2, 0], coefficients[2, 1])
+        pitch = (pitch_col + pitch_row) / 2.0
+        threshold = max(float(min_threshold_px), pitch * inlier_threshold_ratio)
+
+        new_inliers = residual <= threshold
+        # 保护：inlier 太少说明整体拟合已不可信（如上游整片错位），
+        # 此时宁可不动，也不能把大量点吸附到错误模型上。
+        if int(new_inliers.sum()) < max(6, expected_count // 2):
+            info["reason"] = "晶格模型 inlier 不足，跳过修正"
+            return points.copy(), info
+        if np.array_equal(new_inliers, inliers):
+            inliers = new_inliers
+            break
+        inliers = new_inliers
+
+    corrected = points.copy()
+    outlier_indices = np.flatnonzero(~inliers)
+    corrected[outlier_indices] = predicted[outlier_indices].astype(np.float32)
+
+    inlier_residual = np.linalg.norm(xy[inliers] - predicted[inliers], axis=1)
+    info.update(
+        {
+            "applied": True,
+            "reason": "ok",
+            "outlier_count": int(outlier_indices.size),
+            "corrected_points": [
+                {
+                    "row": int(index // grid_size),
+                    "col": int(index % grid_size),
+                    "shift_px": round(float(np.linalg.norm(xy[index] - predicted[index])), 4),
+                }
+                for index in outlier_indices
+            ],
+            "pitch_px": round(float(pitch), 4),
+            "threshold_px": round(float(threshold), 4),
+            "inlier_rmse_px": round(float(np.sqrt(np.mean(inlier_residual**2))), 6) if inlier_residual.size else 0.0,
+        }
+    )
+    return corrected, info
+
+
 def extract_roi_measurements(
     image: np.ndarray,
     points: np.ndarray,
@@ -821,6 +942,9 @@ def process_image(
     pitch = (rectified_size * (1.0 - 2.0 * config.margin_ratio)) / max(grid_size - 1, 1)
     roi_radius = max(3, int(round(pitch * config.roi_radius_ratio)))
     refined_points = refine_grid_points(rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32)))
+    # 局部精修可能被细长暗线、阴影或高光拉偏个别点；
+    # 最后用全局规则晶格约束把明显偏离的点吸附回晶格模型位置。
+    refined_points, lattice_info = enforce_lattice_consistency(refined_points, grid_size)
 
     records = extract_roi_measurements(rectified, refined_points, grid_size=grid_size, roi_radius=roi_radius)
     quality = evaluate_quality(original, rectified, records)
@@ -843,11 +967,12 @@ def process_image(
     write_measurements_csv(output_dir / "values.csv", records)
 
     result: dict[str, object] = {
-        "algorithm": "PG-Grid V1.3 OpenCV grid with localization-evaluation support",
+        "algorithm": "PG-Grid V1.4 OpenCV grid with lattice-consistency correction",
         "image_path": str(image_path),
         "grid_size": int(grid_size),
         "point_count": int(len(refined_points)),
         "grid_points": grid_points,
+        "lattice_consistency": lattice_info,
         "roi_radius": int(roi_radius),
         "rectified_size": int(rectified_size),
         "chip_region": {

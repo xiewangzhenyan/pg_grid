@@ -24,8 +24,23 @@ The current implementation follows this pipeline:
 3. Generate or fit a physically constrained grid.
 4. For 10x10 patterns, enhance dark square candidates and fit a regular lattice.
 5. Refine each local center with component-level constraints.
-6. Extract ROI statistics and write CSV/JSON outputs.
-7. Compare predicted grid points with annotation points and generate localization reports.
+6. Enforce global lattice consistency: fit a robust affine lattice model over
+   `(row, col) -> (x, y)` with iterative thresholded re-fitting, then snap
+   points pulled away by thin dark lines, local shadows, or highlights back to
+   the model prediction. Inliers keep their locally refined positions, and the
+   correction diagnostics are written to `result.json` as `lattice_consistency`.
+7. Extract ROI statistics and write CSV/JSON outputs.
+8. Compare predicted grid points with annotation points and generate localization reports.
+
+Robustness notes:
+
+- Axis-cluster selection for 10x10 lattice fitting pre-filters clusters by
+  support before enumerating combinations, which bounds the search to
+  `C(16, 10)` and avoids the combinatorial blow-up caused by spurious clusters
+  from screws or edge fragments.
+- The lattice-consistency step skips grids smaller than 3x3 and refuses to
+  correct anything when fewer than half of the points agree with the fitted
+  model, so a globally wrong fit can never drag valid points away.
 
 ## Quick Start
 
