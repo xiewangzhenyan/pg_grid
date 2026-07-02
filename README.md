@@ -9,10 +9,13 @@ No application-specific background is required to use or review this repository.
 ## Main Files
 
 - `pg_grid.py`: core localization pipeline.
+- `pg_quant.py`: PG-Quant V1.0 unit-level quantification (ROI + background annulus, self-referenced flat-field correction, color and intensity feature sets, per-unit quality flags).
 - `pg_grid_eval.py`: annotation loading, prediction loading, localization metrics, and report generation.
 - `pg_grid_demo.py`: command-line single-image pipeline runner.
+- `pg_quant_demo.py`: command-line quantification runner based on an existing `result.json`.
 - `pg_grid_annotator.py`: semi-automatic point annotation initializer and OpenCV-based correction tool.
 - `pg_grid_evaluate.py`: command-line localization-evaluation runner.
+- `docs/next_stage_design.md`: V2 design document (localization + quantification roadmap).
 - `tests/`: pytest tests based on synthetic grid images and synthetic point records.
 
 ## Algorithm Summary
@@ -105,6 +108,33 @@ Evaluate localization error:
 python pg_grid_evaluate.py --annotation annotations/sample_10x10_initial.json --prediction outputs/sample_10x10/result.json --image outputs/sample_10x10/rectified_chip.jpg --output reports/sample_10x10_initial
 ```
 
+## PG-Quant V1.0: Unit-Level Quantification
+
+After localization, the pipeline quantifies every array unit on the rectified
+image:
+
+1. **Circular signal ROI + background annulus**: each unit gets a conservative
+   disk ROI (0.18 pitch) and a surrounding background ring (0.30–0.44 pitch)
+   sampled from the gap between units, providing a local background reference.
+2. **Self-referenced flat-field correction**: the annulus medians of all units
+   are themselves samples of the illumination field. A second-order polynomial
+   is fitted to them (with robust re-fitting and a constant-field fallback) and
+   used for multiplicative correction — no external calibration target needed.
+3. **Two feature sets**: color features (raw and corrected BGR medians,
+   chromaticity, Lab) and intensity features (signed background-subtracted
+   signal, relative signal ratio, field-corrected signal, integrated signal,
+   SNR against annulus noise).
+4. **Per-unit quality flags**: `saturated`, `under_exposed`, `low_snr`,
+   `roi_out_of_bounds`, `non_uniform` (ROI contamination fraction that would
+   threaten the median), `background_anomaly` (annulus deviating from the
+   fitted illumination field), summarized into a `quant_reliable` boolean.
+
+Re-run quantification on an existing localization result:
+
+```powershell
+python pg_quant_demo.py --result outputs/sample_10x10/result.json
+```
+
 ## Outputs
 
 Each pipeline run writes:
@@ -113,7 +143,9 @@ Each pipeline run writes:
 - `rectified_chip.jpg`
 - `roi_debug.jpg`
 - `values.csv`
-- `result.json`, including `grid_points`
+- `result.json`, including `grid_points` and `quant_summary`
+- `quant_values.csv`: per-unit features and quality flags
+- `quant_result.json`: quantification metadata, illumination model, and per-unit records
 
 Each evaluation run writes:
 
