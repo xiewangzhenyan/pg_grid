@@ -65,6 +65,25 @@ def _validate_point_sets(reference_points: list[PointRecord], predicted_points: 
             )
 
 
+def _estimate_reference_pitch(points: list[PointRecord], grid_size: int) -> float:
+    """从人工标注点估计网格间距（行内水平距 + 列内垂直距的中位数均值）。
+
+    间距用于把像素误差归一为“间距百分比”，使 10×10 与 15×15、
+    不同矫正分辨率下的结果可以直接比较。无法估计时返回 0。
+    """
+
+    if grid_size < 2 or len(points) != grid_size * grid_size:
+        return 0.0
+    coords = np.asarray([[float(p["x"]), float(p["y"])] for p in points], dtype=np.float64)
+    lattice = coords.reshape(grid_size, grid_size, 2)
+    dx = np.abs(np.diff(lattice[:, :, 0], axis=1))
+    dy = np.abs(np.diff(lattice[:, :, 1], axis=0))
+    pitch = (float(np.median(dx)) + float(np.median(dy))) / 2.0
+    if not math.isfinite(pitch) or pitch <= 0.0:
+        return 0.0
+    return pitch
+
+
 def compute_localization_errors(
     reference_points: Iterable[PointRecord],
     predicted_points: Iterable[PointRecord],
@@ -73,13 +92,15 @@ def compute_localization_errors(
     """计算预测点相对人工标注点的定位误差。
 
     返回：
-    - errors：逐点误差列表，包含 dx、dy、error_px；
-    - metrics：整体统计指标，包含平均值、中位数、P90、最大值和阈值通过率。
+    - errors：逐点误差列表，包含 dx、dy、error_px 和按间距归一的 error_pct_pitch；
+    - metrics：整体统计指标，包含像素域与间距百分比域两套误差。
     """
 
     reference = normalize_point_records(reference_points)
     predicted = normalize_point_records(predicted_points)
     _validate_point_sets(reference, predicted, grid_size)
+
+    pitch = _estimate_reference_pitch(reference, grid_size)
 
     errors: list[dict[str, float | int]] = []
     error_values: list[float] = []
@@ -99,6 +120,7 @@ def compute_localization_errors(
                 "dx": round(dx, 4),
                 "dy": round(dy, 4),
                 "error_px": round(error_px, 6),
+                "error_pct_pitch": round(error_px / pitch * 100.0, 6) if pitch > 0 else 0.0,
             }
         )
 
@@ -114,6 +136,23 @@ def compute_localization_errors(
         "pass_ratio_5px": round(float((values <= 5.0).mean()), 6),
         "pass_ratio_10px": round(float((values <= 10.0).mean()), 6),
     }
+
+    # 间距归一化指标：像素误差除以标注网格间距。pitch 无法估计（如 1×1
+    # 网格）时输出 0 并保持 pitch_px=0，调用方可据此忽略百分比域。
+    metrics["pitch_px"] = round(pitch, 6)
+    if pitch > 0:
+        pct = values / pitch * 100.0
+        metrics["mean_error_pct_pitch"] = round(float(pct.mean()), 6)
+        metrics["median_error_pct_pitch"] = round(float(np.median(pct)), 6)
+        metrics["p90_error_pct_pitch"] = round(float(np.percentile(pct, 90)), 6)
+        metrics["max_error_pct_pitch"] = round(float(pct.max()), 6)
+        metrics["pass_ratio_5pct_pitch"] = round(float((pct <= 5.0).mean()), 6)
+    else:
+        metrics["mean_error_pct_pitch"] = 0.0
+        metrics["median_error_pct_pitch"] = 0.0
+        metrics["p90_error_pct_pitch"] = 0.0
+        metrics["max_error_pct_pitch"] = 0.0
+        metrics["pass_ratio_5pct_pitch"] = 0.0
     return errors, metrics
 
 

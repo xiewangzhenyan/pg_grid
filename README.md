@@ -36,11 +36,18 @@ The current implementation follows this pipeline:
    is rotated back. Projection-peak fitting and the uniform physical grid stay
    as fallbacks.
 4. Refine each local center with component-level constraints.
-5. Enforce global lattice consistency: fit a robust affine lattice model over
-   `(row, col) -> (x, y)` with iterative thresholded re-fitting, then snap
-   points pulled away by thin dark lines, local shadows, or highlights back to
-   the model prediction. Inliers keep their locally refined positions, and the
-   correction diagnostics are written to `result.json` as `lattice_consistency`.
+5. Lattice bundle adjustment (V2.0): local refinement collects observations
+   with real image evidence, an 8-DoF homography over `(row, col) -> (x, y)`
+   is fitted with Tukey-IRLS (the projective terms absorb residual perspective
+   that an affine model cannot express), windows are re-centered on the model
+   prediction for a second refinement pass, and the final fit assigns each
+   point a `confidence`, a `source` (`candidate_refined` vs `model_imputed`),
+   and `flags`. Only evidence-backed observations vote, which mechanically
+   removes the "regular-but-wrong majority" failure mode, and a candidate
+   support ratio provides an external-evidence check: grids whose points are
+   not backed by detected blobs are marked untrusted and downgrade the frame
+   quality with machine-readable `reasons`. Diagnostics are written to
+   `result.json` as `lattice_consistency` (legacy keys preserved).
 6. Extract ROI statistics and write CSV/JSON outputs.
 7. Compare predicted grid points with annotation points and generate localization reports.
 
@@ -143,7 +150,8 @@ Each pipeline run writes:
 - `rectified_chip.jpg`
 - `roi_debug.jpg`
 - `values.csv`
-- `result.json`, including `grid_points` and `quant_summary`
+- `result.json`, including `grid_points` (each point now carries
+  `confidence`/`source`/`flags`), `lattice_consistency`, and `quant_summary`
 - `quant_values.csv`: per-unit features and quality flags
 - `quant_result.json`: quantification metadata, illumination model, and per-unit records
 

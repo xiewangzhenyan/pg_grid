@@ -765,16 +765,24 @@ def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float =
     return np.array([[x, y] for y in ys for x in xs], dtype=np.float32)
 
 
-def refine_grid_points(rectified: np.ndarray, points: np.ndarray, grid_size: int, radius: int) -> np.ndarray:
-    """在每个理论点周围做局部中心微调。
+def _refine_grid_points_with_status(
+    rectified: np.ndarray,
+    points: np.ndarray,
+    grid_size: int,
+    radius: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """局部精修，并返回每个点是否获得了图像证据支持。
 
-    微调必须是“小步”的：全局网格位置来自物理模型，局部只允许在小窗口内修正。
-    这样可以避免反光、气泡、脏点把某个 ROI 拉到错误位置。
+    status[i] 为 True 表示该点在局部窗口内找到了可信的结构中心
+    （方形组件或质心），False 表示窗口内没有证据或证据被限幅拒绝。
+    光束法平差只用有证据的观测拟合全局模型，从机制上避免
+    “无证据点占多数时锁定错误网格”的失效模式。
     """
 
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
     refined = points.copy().astype(np.float32)
+    status = np.zeros(points.shape[0], dtype=bool)
     polarity_bright = grid_size >= 15
 
     for idx, (x, y) in enumerate(points):
@@ -782,6 +790,7 @@ def refine_grid_points(rectified: np.ndarray, points: np.ndarray, grid_size: int
             square_center = _refine_one_10x10_dark_square_center(gray, float(x), float(y), radius)
             if square_center is not None:
                 refined[idx] = square_center
+                status[idx] = True
                 continue
 
         x0 = max(0, int(round(x)) - radius)
@@ -812,7 +821,19 @@ def refine_grid_points(rectified: np.ndarray, points: np.ndarray, grid_size: int
         max_shift = max(2.0, radius * 0.65)
         if math.hypot(cx - x, cy - y) <= max_shift:
             refined[idx] = (cx, cy)
+            status[idx] = True
 
+    return refined, status
+
+
+def refine_grid_points(rectified: np.ndarray, points: np.ndarray, grid_size: int, radius: int) -> np.ndarray:
+    """在每个理论点周围做局部中心微调。
+
+    微调必须是“小步”的：全局网格位置来自物理模型，局部只允许在小窗口内修正。
+    这样可以避免反光、气泡、脏点把某个 ROI 拉到错误位置。
+    """
+
+    refined, _ = _refine_grid_points_with_status(rectified, points, grid_size, radius)
     return refined
 
 
@@ -824,6 +845,9 @@ def enforce_lattice_consistency(
     max_iterations: int = 5,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """用全局规则晶格约束修正被局部干扰拉偏的点位。
+
+    注：V2.0 起主管线改由 bundle_adjust_lattice（单应模型 + 证据加权）
+    承担此职责；本函数保留为轻量工具与向后兼容接口。
 
     物理先验：阵列点位构成刚性规则晶格，矫正残差只会表现为整体的
     仿射变形（平移/缩放/旋转/轻微剪切），单个点不应独立漂移。
@@ -925,6 +949,269 @@ def enforce_lattice_consistency(
     return corrected, info
 
 
+def _apply_homography(h_matrix: np.ndarray, src: np.ndarray) -> np.ndarray:
+    """把 N×2 点集经单应矩阵映射到目标坐标系。"""
+
+    homogeneous = np.column_stack([src, np.ones(src.shape[0])])
+    mapped = homogeneous @ h_matrix.T
+    denom = mapped[:, 2:3]
+    denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+    return mapped[:, :2] / denom
+
+
+def _normalize_for_dlt(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Hartley 归一化：平移到质心、缩放平均距离为 sqrt(2)，改善 DLT 条件数。"""
+
+    centroid = points.mean(axis=0)
+    mean_distance = float(np.linalg.norm(points - centroid, axis=1).mean()) + 1e-12
+    scale = math.sqrt(2.0) / mean_distance
+    transform = np.array(
+        [[scale, 0.0, -scale * centroid[0]], [0.0, scale, -scale * centroid[1]], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    normalized = (points - centroid) * scale
+    return normalized, transform
+
+
+def _fit_homography_irls(src: np.ndarray, dst: np.ndarray, iterations: int = 5) -> np.ndarray | None:
+    """用加权 DLT + Tukey 双权 IRLS 拟合 src -> dst 的 8 自由度单应。
+
+    src 是晶格索引 (col, row)，dst 是像素观测。观测数远大于自由度
+    （100/225 对 8），少数被局部干扰拉偏的观测会在迭代中被降权。
+    """
+
+    point_count = src.shape[0]
+    if point_count < 8:
+        return None
+
+    src_n, t_src = _normalize_for_dlt(src.astype(np.float64))
+    dst_n, t_dst = _normalize_for_dlt(dst.astype(np.float64))
+    weights = np.ones(point_count, dtype=np.float64)
+    h_matrix: np.ndarray | None = None
+
+    for _ in range(iterations):
+        sx, sy = src_n[:, 0], src_n[:, 1]
+        dx, dy = dst_n[:, 0], dst_n[:, 1]
+        zeros = np.zeros(point_count)
+        ones = np.ones(point_count)
+        row_u = np.stack([sx, sy, ones, zeros, zeros, zeros, -dx * sx, -dx * sy, -dx], axis=1)
+        row_v = np.stack([zeros, zeros, zeros, sx, sy, ones, -dy * sx, -dy * sy, -dy], axis=1)
+        sqrt_w = np.sqrt(weights)[:, None]
+        design = np.concatenate([row_u * sqrt_w, row_v * sqrt_w], axis=0)
+
+        try:
+            _, _, vt = np.linalg.svd(design, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return h_matrix
+        h_normalized = vt[-1].reshape(3, 3)
+        candidate = np.linalg.inv(t_dst) @ h_normalized @ t_src
+        if abs(candidate[2, 2]) < 1e-12:
+            return h_matrix
+        candidate = candidate / candidate[2, 2]
+        h_matrix = candidate
+
+        residual = np.linalg.norm(dst - _apply_homography(h_matrix, src), axis=1)
+        # Tukey 双权：尺度用 MAD，下限 0.3px 防止零残差合成数据退化。
+        sigma = max(0.3, 1.4826 * float(np.median(np.abs(residual - np.median(residual)))))
+        tukey_c = 4.685 * sigma
+        ratio = np.clip(residual / tukey_c, 0.0, 1.0)
+        new_weights = (1.0 - ratio**2) ** 2
+        if float(new_weights.sum()) < 8.0:
+            break
+        weights = new_weights
+
+    return h_matrix
+
+
+def _estimate_grid_pitch(points: np.ndarray, grid_size: int, fallback: float) -> float:
+    """从行内/列内相邻点距估计网格间距，异常时使用兜底值。"""
+
+    if grid_size >= 2 and points.shape[0] == grid_size * grid_size:
+        lattice = points.reshape(grid_size, grid_size, 2)
+        dx = np.abs(np.diff(lattice[:, :, 0], axis=1))
+        dy = np.abs(np.diff(lattice[:, :, 1], axis=0))
+        pitch = (float(np.median(dx)) + float(np.median(dy))) / 2.0
+        if math.isfinite(pitch) and pitch > 2.0:
+            return pitch
+    return float(fallback)
+
+
+def _candidate_support_ratio(
+    rectified: np.ndarray,
+    points: np.ndarray,
+    grid_size: int,
+    pitch: float,
+) -> float | None:
+    """计算网格点获得真实候选（黑帽/顶帽连通域）支撑的比例。
+
+    这是防"多数锁定"的外部证据：一个规则但错误的网格可以骗过
+    任何自洽性检查，却骗不过"点位附近是否真的存在图像结构"。
+    没有对应检测器的网格规格返回 None（检查不可用，而非通过）。
+    """
+
+    if grid_size == 10:
+        candidates = _detect_dark_square_candidates(rectified)
+    elif grid_size >= 15:
+        candidates = _detect_bright_dot_candidates(rectified)
+    else:
+        return None
+
+    if candidates.shape[0] == 0:
+        return 0.0
+
+    tolerance = max(3.0, pitch * 0.25)
+    centers = candidates[:, :2]
+    supported = 0
+    for point in points:
+        distances = np.linalg.norm(centers - point, axis=1)
+        if float(distances.min()) <= tolerance:
+            supported += 1
+    return supported / max(points.shape[0], 1)
+
+
+def bundle_adjust_lattice(
+    rectified: np.ndarray,
+    points: np.ndarray,
+    grid_size: int,
+    inlier_threshold_ratio: float = 0.18,
+    min_threshold_px: float = 2.5,
+    radius: int | None = None,
+) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
+    """晶格光束法平差：用全体阵列点共同估计全局单应几何。
+
+    流程（EM 式两轮）：
+    1. 从初始网格做局部精修，只保留有图像证据的观测；
+    2. 用这些观测以 Tukey-IRLS 拟合 (col,row) -> (x,y) 的 8 自由度单应
+       （相对仿射模型多出的透视项吸收矫正残差）；
+    3. 以模型预测为中心重新开窗再精修一轮，再拟合一次得到最终模型
+       （窗口重新居中能找回初始网格没盖住的单元；窗口尺寸保持不变，
+       因为组件精修的几何限制随窗口缩放，窗口小于单元会拒绝真实目标）；
+    4. 有证据且残差在阈值内的点采用观测值（source=candidate_refined），
+       其余点吸附到模型预测（source=model_imputed）。
+
+    与 enforce_lattice_consistency 的关键差异：模型只拟合有图像证据的
+    观测，无证据点不参与投票，从机制上消除"规则但错误的多数派
+    锁定模型"的失效模式；此外还输出候选支撑率作为外部证据校验。
+
+    返回 (最终点位, 诊断信息, 逐点元信息[confidence/source/flags])。
+    诊断信息保持 enforce_lattice_consistency 的旧键位并新增
+    model/candidate_support_ratio/trusted/observed_ratio 等字段。
+    """
+
+    points = np.asarray(points, dtype=np.float32)
+    expected_count = grid_size * grid_size
+    height, width = rectified.shape[:2]
+    fallback_pitch = min(width, height) / max(grid_size + 1, 2)
+    pitch = _estimate_grid_pitch(points, grid_size, fallback_pitch)
+    threshold = max(float(min_threshold_px), pitch * inlier_threshold_ratio)
+
+    def _passthrough(reason: str, support: float | None) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
+        info = {
+            "applied": False,
+            "reason": reason,
+            "model": "homography",
+            "outlier_count": 0,
+            "corrected_points": [],
+            "pitch_px": round(pitch, 4),
+            "threshold_px": round(threshold, 4),
+            "inlier_rmse_px": 0.0,
+            "candidate_support_ratio": None if support is None else round(float(support), 6),
+            "trusted": bool(support is None),
+            "observed_ratio": 0.0,
+            "mean_confidence": 0.0,
+        }
+        meta = [{"confidence": 0.0, "source": "unadjusted", "flags": []} for _ in range(points.shape[0])]
+        return points.copy(), info, meta
+
+    if grid_size < 3:
+        return _passthrough("grid_size 小于 3，全局模型不可靠", None)
+    if points.shape[0] != expected_count:
+        return _passthrough(f"点数 {points.shape[0]} 与 {grid_size}x{grid_size} 不符", None)
+
+    indices = np.arange(expected_count)
+    lattice_index = np.stack([indices % grid_size, indices // grid_size], axis=1).astype(np.float64)
+    min_evidence = max(8, int(expected_count * 0.4))
+
+    # 第一轮：常规窗口精修，收集图像证据。
+    # 窗口半径优先用调用方给定值（如 process_image 的名义间距公式），
+    # 组件精修的几何上限随窗口缩放，窗口过小会把大尺寸单元误拒。
+    radius_pass1 = radius if radius is not None else max(4, int(pitch * 0.32))
+    observed1, status1 = _refine_grid_points_with_status(rectified, points, grid_size, radius_pass1)
+    if int(status1.sum()) < min_evidence:
+        support = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        return _passthrough("有效图像观测不足，跳过全局平差", support)
+
+    h_first = _fit_homography_irls(lattice_index[status1], observed1[status1].astype(np.float64))
+    if h_first is None:
+        support = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        return _passthrough("单应拟合失败", support)
+    predicted1 = _apply_homography(h_first, lattice_index).astype(np.float32)
+
+    # 第二轮：以模型预测为中心重新开窗精修。窗口尺寸与第一轮一致：
+    # 组件精修的方块尺寸上限随窗口缩放，窗口小于单元会把真实目标拒掉。
+    observed2, status2 = _refine_grid_points_with_status(rectified, predicted1, grid_size, radius_pass1)
+    if int(status2.sum()) >= min_evidence:
+        h_final = _fit_homography_irls(lattice_index[status2], observed2[status2].astype(np.float64))
+        if h_final is None:
+            h_final, observed2, status2 = h_first, observed1, status1
+    else:
+        h_final, observed2, status2 = h_first, observed1, status1
+
+    predicted = _apply_homography(h_final, lattice_index).astype(np.float32)
+    residual = np.linalg.norm(observed2.astype(np.float64) - predicted.astype(np.float64), axis=1)
+    inlier = status2 & (residual <= threshold)
+    if int(inlier.sum()) < min_evidence:
+        support = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        return _passthrough("晶格模型 inlier 不足，跳过全局平差", support)
+
+    final_points = points.copy()
+    final_points[inlier] = observed2[inlier]
+    final_points[~inlier] = predicted[~inlier]
+
+    # 逐点元信息：inlier 用残差换算置信度，补位点给固定的中等偏低置信度。
+    point_meta: list[dict[str, object]] = []
+    corrected: list[dict[str, object]] = []
+    for index in range(expected_count):
+        if inlier[index]:
+            confidence = math.exp(-((residual[index] / threshold) ** 2))
+            point_meta.append(
+                {"confidence": round(float(confidence), 4), "source": "candidate_refined", "flags": []}
+            )
+        else:
+            # 0.3 的含义：位置来自全局模型，通常准确（模型 RMSE 量级），
+            # 但没有局部图像证据背书，下游应降权使用。
+            point_meta.append(
+                {"confidence": 0.3, "source": "model_imputed", "flags": ["imputed_position"]}
+            )
+            shift = float(np.linalg.norm(final_points[index] - points[index]))
+            corrected.append(
+                {
+                    "row": int(index // grid_size),
+                    "col": int(index % grid_size),
+                    "shift_px": round(shift, 4),
+                }
+            )
+
+    support = _candidate_support_ratio(rectified, final_points, grid_size, pitch)
+    trusted = support is None or support >= 0.6
+    inlier_residual = residual[inlier]
+    info: dict[str, object] = {
+        "applied": True,
+        "reason": "ok",
+        "model": "homography",
+        "outlier_count": int((~inlier).sum()),
+        "corrected_points": corrected,
+        "pitch_px": round(pitch, 4),
+        "threshold_px": round(threshold, 4),
+        "inlier_rmse_px": round(float(np.sqrt(np.mean(inlier_residual**2))), 6) if inlier_residual.size else 0.0,
+        "candidate_support_ratio": None if support is None else round(float(support), 6),
+        "trusted": bool(trusted),
+        "observed_ratio": round(float(status2.sum()) / expected_count, 6),
+        "mean_confidence": round(float(np.mean([m["confidence"] for m in point_meta])), 6),
+    }
+    return final_points, info, point_meta
+
+
 def extract_roi_measurements(
     image: np.ndarray,
     points: np.ndarray,
@@ -993,10 +1280,17 @@ def extract_roi_measurements(
     return records
 
 
-def evaluate_quality(original: np.ndarray, rectified: np.ndarray, records: list[dict[str, float | int]]) -> dict[str, float | str]:
+def evaluate_quality(
+    original: np.ndarray,
+    rectified: np.ndarray,
+    records: list[dict[str, float | int]],
+    geometry_info: dict[str, object] | None = None,
+) -> dict[str, float | str | list[str]]:
     """生成拍摄质量控制指标。
 
     这些指标用于安卓端提示用户：是否过曝、是否模糊、网格是否可靠。
+    geometry_info 为可选的晶格平差诊断（bundle_adjust_lattice 输出）；
+    提供时会参与判级并在 reasons 中给出机器可读的降级原因。
     """
 
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
@@ -1017,6 +1311,27 @@ def evaluate_quality(original: np.ndarray, rectified: np.ndarray, records: list[
     else:
         status = "fail"
 
+    # 几何健康度只会下调判级，不会掩盖曝光/清晰度问题。
+    reasons: list[str] = []
+    severity = {"pass": 0, "warn": 1, "fail": 2}
+    if geometry_info is not None:
+        support = geometry_info.get("candidate_support_ratio")
+        if not bool(geometry_info.get("trusted", True)):
+            reasons.append("grid_support_low")
+            floor_status = "fail" if (support is not None and float(support) < 0.35) else "warn"
+            if severity[floor_status] > severity[status]:
+                status = floor_status
+        if not bool(geometry_info.get("applied", False)):
+            reasons.append("geometry_unadjusted")
+            if severity["warn"] > severity[status]:
+                status = "warn"
+        point_count = max(len(records), 1)
+        imputed_ratio = float(geometry_info.get("outlier_count", 0)) / point_count
+        if imputed_ratio > 0.2:
+            reasons.append("high_imputed_ratio")
+            if severity["warn"] > severity[status]:
+                status = "warn"
+
     return {
         "status": status,
         "overall_score": round(overall, 6),
@@ -1026,6 +1341,7 @@ def evaluate_quality(original: np.ndarray, rectified: np.ndarray, records: list[
         "saturation_ratio": round(saturation_ratio, 6),
         "underexposure_ratio": round(underexposure_ratio, 6),
         "laplacian_variance": round(blur_var, 6),
+        "reasons": reasons,
     }
 
 
@@ -1125,19 +1441,24 @@ def process_image(
     theoretical_points = fit_grid_points(rectified, grid_size, margin_ratio=config.margin_ratio)
     pitch = (rectified_size * (1.0 - 2.0 * config.margin_ratio)) / max(grid_size - 1, 1)
     roi_radius = max(3, int(round(pitch * config.roi_radius_ratio)))
-    refined_points = refine_grid_points(rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32)))
-    # 局部精修可能被细长暗线、阴影或高光拉偏个别点；
-    # 最后用全局规则晶格约束把明显偏离的点吸附回晶格模型位置。
-    refined_points, lattice_info = enforce_lattice_consistency(refined_points, grid_size)
+    # V2.0：晶格光束法平差内部完成两轮重定心精修 + 全局单应拟合，
+    # 输出逐点置信度/来源，并用候选支撑率做外部证据校验。
+    # 窗口半径沿用与历史版本一致的名义间距公式，保持精修行为等价。
+    refined_points, lattice_info, point_meta = bundle_adjust_lattice(
+        rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32))
+    )
 
     records = extract_roi_measurements(rectified, refined_points, grid_size=grid_size, roi_radius=roi_radius)
-    quality = evaluate_quality(original, rectified, records)
+    quality = evaluate_quality(original, rectified, records, geometry_info=lattice_info)
     grid_points = [
         {
             "row": int(index // grid_size),
             "col": int(index % grid_size),
             "x": round(float(point[0]), 4),
             "y": round(float(point[1]), 4),
+            "confidence": point_meta[index]["confidence"],
+            "source": point_meta[index]["source"],
+            "flags": point_meta[index]["flags"],
         }
         for index, point in enumerate(refined_points)
     ]
@@ -1156,7 +1477,7 @@ def process_image(
     quant_outputs = write_quant_outputs(output_dir, quant_records, quant_meta)
 
     result: dict[str, object] = {
-        "algorithm": "PG-Grid V1.5 with PG-Quant V1.0 unit-level quantification",
+        "algorithm": "PG-Grid V2.0 bundle-adjusted localization with PG-Quant V1.0",
         "image_path": str(image_path),
         "grid_size": int(grid_size),
         "point_count": int(len(refined_points)),
