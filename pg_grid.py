@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from pg_quant import quantify_rectified, write_quant_outputs
+from pg_quant_viz import write_quant_visualizations
 
 
 @dataclass
@@ -1475,6 +1476,8 @@ def process_image(
     # 旧输出（values.csv 等）全部保留，定量结果写入独立的 quant_* 文件。
     quant_records, quant_meta = quantify_rectified(rectified, refined_points, grid_size)
     quant_outputs = write_quant_outputs(output_dir, quant_records, quant_meta)
+    # 定量可视化：状态叠图 + 强度/SNR 热图 + 校正后颜色分布图。
+    quant_outputs.update(write_quant_visualizations(output_dir, rectified, quant_records, quant_meta))
 
     result: dict[str, object] = {
         "algorithm": "PG-Grid V2.0 bundle-adjusted localization with PG-Quant V1.0",
@@ -1506,6 +1509,10 @@ def process_image(
             "result_json": str(output_dir / "result.json"),
             "quant_values_csv": quant_outputs["quant_values_csv"],
             "quant_result_json": quant_outputs["quant_result_json"],
+            "quant_overlay": quant_outputs["quant_overlay"],
+            "quant_heatmap_intensity": quant_outputs["quant_heatmap_intensity"],
+            "quant_heatmap_snr": quant_outputs["quant_heatmap_snr"],
+            "quant_color_map": quant_outputs["quant_color_map"],
         },
         "neural_detector_slot": {
             "enabled": False,

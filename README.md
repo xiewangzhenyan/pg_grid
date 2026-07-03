@@ -10,6 +10,9 @@ No application-specific background is required to use or review this repository.
 
 - `pg_grid.py`: core localization pipeline.
 - `pg_quant.py`: PG-Quant V1.0 unit-level quantification (ROI + background annulus, self-referenced flat-field correction, color and intensity feature sets, per-unit quality flags).
+- `pg_quant_viz.py`: unit-level visualizations (intensity/SNR heatmaps, corrected-color map, reliability overlay).
+- `pg_benchmark.py`: seeded synthetic perturbation benchmark (7 perturbation families) with degradation-curve reports and A/B comparison.
+- `pg_benchmark_demo.py`: command-line benchmark runner and report comparator.
 - `pg_grid_eval.py`: annotation loading, prediction loading, localization metrics, and report generation.
 - `pg_grid_demo.py`: command-line single-image pipeline runner.
 - `pg_quant_demo.py`: command-line quantification runner based on an existing `result.json`.
@@ -141,6 +144,42 @@ Re-run quantification on an existing localization result:
 ```powershell
 python pg_quant_demo.py --result outputs/sample_10x10/result.json
 ```
+
+## Quantification Visualizations
+
+Every pipeline run also renders four unit-level views:
+
+- `quant_overlay.jpg`: rectified image with ROI circles colored by
+  `quant_reliable` (green/red), background annulus rings, and flag codes next
+  to unreliable units (S=saturated, U=under-exposed, N=low SNR, B=out of
+  bounds, H=non-uniform, A=background anomaly, I=imputed).
+- `quant_heatmap_intensity.jpg`: grid heatmap of the corrected
+  background-subtracted signal (Viridis colormap with a value scale bar;
+  unreliable cells are crossed out).
+- `quant_heatmap_snr.jpg`: grid heatmap of per-unit SNR.
+- `quant_color_map.jpg`: each cell filled with the unit's corrected BGR color —
+  the most direct view of the per-unit color distribution.
+
+## Perturbation Benchmark and A/B Comparison
+
+`pg_benchmark.py` generates fully seeded synthetic scenes (known unit centers
+and a known photometric gradient across units) and sweeps seven perturbation
+families — rotation, perspective, blur, illumination gradient, occlusion,
+glare, and noise — each across an intensity ladder. Every case runs the full
+pipeline and records localization error (px and % of pitch), quantification
+rank-order fidelity (Spearman against the known gradient), per-unit
+reliability ratio, and geometry-trust telemetry, producing degradation-curve
+data rather than single-point metrics.
+
+```powershell
+python pg_benchmark_demo.py --grid 10 --seeds 2 --output reports/bench_v2
+python pg_benchmark_demo.py --compare reports/bench_a/benchmark_report.json reports/bench_b/benchmark_report.json
+```
+
+Because scenes are byte-reproducible for a given seed, comparing two code
+versions only requires running the same benchmark on each checkout and diffing
+the reports; the comparator aligns cases, prints per-family metric deltas, and
+lists regressed cases. Images are generated on demand and never committed.
 
 ## Outputs
 
