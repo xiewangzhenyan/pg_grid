@@ -233,6 +233,60 @@ def test_fit_grid_points_10x10_does_not_degenerate_to_uniform_split():
     assert float(uniform_errors.mean()) > 30.0
 
 
+def test_select_regular_axis_completes_missing_edge_cluster():
+    """缺一个边缘行/列簇时，轴选择必须按间距外推补全，而不是放弃。
+
+    9 个连续簇 + 网格近似居中（矫正对称外扩的物理先验）时，
+    缺失位置唯一可辨：补在前端才能保持左右边距对称。
+    """
+    from pg_grid import _select_regular_axis_from_clusters
+
+    # 真值：10 个中心 131..668（pitch 59.7，边距对称）；第 0 个缺失。
+    full = [131.0 + 59.7 * i for i in range(10)]
+    clusters = [(center, 40.0, 8) for center in full[1:]]
+
+    axis = _select_regular_axis_from_clusters(clusters, count=10, length=800)
+
+    assert axis is not None, "缺一个簇不应导致整个轴选择失败"
+    assert np.allclose(axis, full, atol=2.0)
+
+
+def test_select_regular_axis_completes_missing_middle_cluster():
+    """缺一个中间行/列簇时，间距跳变本身就标识了缺口位置。"""
+    from pg_grid import _select_regular_axis_from_clusters
+
+    full = [112.0 + 64.0 * i for i in range(10)]
+    observed = full[:4] + full[5:]  # 缺第 4 个
+    clusters = [(center, 40.0, 8) for center in observed]
+
+    axis = _select_regular_axis_from_clusters(clusters, count=10, length=800)
+
+    assert axis is not None
+    assert np.allclose(axis, full, atol=2.0)
+
+
+def test_fit_grid_points_10x10_survives_fully_occluded_row():
+    """整行单元被遮挡时，候选晶格拟合必须外推缺失行而不是退化到投影路径。"""
+    import cv2
+    from pg_grid import fit_grid_points
+
+    image, truth = _make_synthetic_rectified_10x10()
+    # 抹掉第 0 行全部方块，并放置遮挡异物（比方块大、会被候选检测过滤）。
+    for col in range(10):
+        cx, cy = truth[col]
+        x_lo, y_lo = int(round(cx - 14)), int(round(cy - 14))
+        image[y_lo:y_lo + 28, x_lo:x_lo + 28] = 200
+        cv2.circle(image, (int(cx), int(cy)), 34, (60, 60, 60), -1)
+
+    fitted = fit_grid_points(image, grid_size=10)
+    errors = np.linalg.norm(fitted - truth, axis=1)
+
+    assert fitted.shape == (100, 2)
+    # 未被遮挡的 90 个单元必须精确；被遮挡行的外推位置允许稍宽容差。
+    assert float(errors[10:].mean()) < 3.0
+    assert float(errors[:10].mean()) < 8.0
+
+
 def test_fit_grid_points_10x10_handles_rotated_lattice():
     """矫正残差导致点阵相对图像坐标轴有几度旋转时，拟合仍须贴合真实中心。
 
@@ -439,6 +493,29 @@ def test_bundle_adjust_marks_occluded_units_imputed_but_accurate():
     assert refined_count >= 90
     assert info["candidate_support_ratio"] >= 0.9
     assert info["trusted"] is True
+
+
+def test_bundle_adjust_support_check_inconclusive_under_heavy_blur():
+    """重模糊使候选检测器失效但精修证据充分时，支撑率检查应判"不可用"而非误报不可信。
+
+    支撑率是防"规则但错误网格"的外部证据；当检测器本身几乎无候选
+    （如重模糊）而逐点精修证据充分时，缺席的是检查手段而不是网格质量。
+    """
+    import cv2
+    from pg_grid import bundle_adjust_lattice, fit_grid_points
+
+    image, truth = _make_synthetic_rectified_10x10()
+    # sigma=8 时黑帽候选检测完全失效（实测 0 候选），而质心精修仍然精确。
+    blurred = cv2.GaussianBlur(image, (49, 49), 8.0)
+
+    initial = fit_grid_points(blurred, grid_size=10)
+    adjusted, info, _ = bundle_adjust_lattice(blurred, initial, grid_size=10)
+
+    assert info["applied"] is True
+    assert info["support_check"] == "inconclusive"
+    assert info["trusted"] is True
+    errors = np.linalg.norm(adjusted - truth, axis=1)
+    assert float(errors.mean()) < 3.0
 
 
 def test_bundle_adjust_rejects_grid_without_image_evidence():
