@@ -526,6 +526,68 @@ def _cluster_axis_candidates(values: np.ndarray, weights: np.ndarray, length: in
     return clusters
 
 
+def _complete_axis_with_missing_clusters(
+    clusters: list[tuple[float, float, int]],
+    count: int,
+    length: int,
+) -> np.ndarray | None:
+    """簇数不足 count 时，按间距锚定索引并外推缺失行/列。
+
+    整行/列单元被遮挡时对应的轴向簇会整体消失，但规则晶格先验让缺失
+    位置可推断：
+    1. 用相邻簇距的中位数估计间距，把每个簇分配到整数晶格索引
+       （中间缺口表现为间距跳变，索引随之跳跃）；
+    2. 剩余的缺失量在两端滑动枚举（边缘缺失存在"补前还是补后"的
+       二义性），用"左右边距对称"消解——矫正阶段的对称外扩保证
+       网格在矫正图中近似居中，这是几何链路自带的物理先验；
+    3. 对每个假设做与完整路径相同的间距/位置/残差校验。
+
+    最多容忍 2 个缺失簇：更多缺失时索引分配的错误风险迅速上升。
+    """
+
+    missing = count - len(clusters)
+    if not 1 <= missing <= 2 or len(clusters) < 3:
+        return None
+
+    centers = np.asarray(sorted(item[0] for item in clusters), dtype=np.float64)
+    diffs = np.diff(centers)
+    pitch_estimate = float(np.median(diffs))
+    if not length * 0.045 <= pitch_estimate <= length * 0.095:
+        return None
+
+    # 间距跳变 -> 索引跳跃（中间缺口）；累计得到相对索引。
+    indices = np.zeros(len(centers), dtype=np.int64)
+    for position, diff in enumerate(diffs):
+        step = max(1, int(round(diff / pitch_estimate)))
+        indices[position + 1] = indices[position] + step
+    span = int(indices[-1])
+    if span > count - 1:
+        return None
+
+    best: tuple[float, np.ndarray] | None = None
+    index_axis = np.arange(count, dtype=np.float64)
+    min_pitch, max_pitch = length * 0.045, length * 0.095
+    min_start, max_start, max_end = length * 0.050, length * 0.300, length * 0.950
+
+    for shift in range(count - span):
+        assigned = indices + shift
+        pitch, start = np.polyfit(assigned.astype(np.float64), centers, deg=1)
+        if not min_pitch <= pitch <= max_pitch:
+            continue
+        fitted = start + pitch * index_axis
+        if fitted[0] < min_start or fitted[0] > max_start or fitted[-1] > max_end:
+            continue
+        residual = centers - (start + pitch * assigned)
+        if float(np.sqrt(np.mean(residual**2))) > length * 0.020:
+            continue
+        # 边距对称性评分：越接近居中越可信。
+        asymmetry = abs(float(fitted[0]) - (length - float(fitted[-1])))
+        if best is None or asymmetry < best[0]:
+            best = (asymmetry, fitted.astype(np.float32))
+
+    return None if best is None else best[1]
+
+
 def _select_regular_axis_from_clusters(
     clusters: list[tuple[float, float, int]],
     count: int,
@@ -535,10 +597,11 @@ def _select_regular_axis_from_clusters(
 
     这里枚举 10 个候选簇的组合，并拟合 `start + pitch * i`。
     评分优先选择残差小、支持强、起止位置合理的组合。
+    簇数不足时转入缺失补全路径（整行/列被遮挡的场景）。
     """
 
     if len(clusters) < count:
-        return None
+        return _complete_axis_with_missing_clusters(clusters, count, length)
 
     # 防组合爆炸：螺丝、边缘碎片可能产生大量杂散簇，簇数一多，
     # C(N, count) 会迅速失控（例如 C(24,10) 约 200 万组合，实测需要一分钟以上）。
@@ -1042,12 +1105,14 @@ def _candidate_support_ratio(
     points: np.ndarray,
     grid_size: int,
     pitch: float,
-) -> float | None:
+) -> tuple[float | None, int]:
     """计算网格点获得真实候选（黑帽/顶帽连通域）支撑的比例。
 
     这是防"多数锁定"的外部证据：一个规则但错误的网格可以骗过
     任何自洽性检查，却骗不过"点位附近是否真的存在图像结构"。
-    没有对应检测器的网格规格返回 None（检查不可用，而非通过）。
+    没有对应检测器的网格规格返回 (None, 0)（检查不可用，而非通过）。
+    返回 (支撑比例, 候选总数)：候选总数供调用方判断检查本身是否可信
+    ——重模糊等场景下检测器整体失效，比例为 0 不代表网格错误。
     """
 
     if grid_size == 10:
@@ -1055,10 +1120,10 @@ def _candidate_support_ratio(
     elif grid_size >= 15:
         candidates = _detect_bright_dot_candidates(rectified)
     else:
-        return None
+        return None, 0
 
     if candidates.shape[0] == 0:
-        return 0.0
+        return 0.0, 0
 
     tolerance = max(3.0, pitch * 0.25)
     centers = candidates[:, :2]
@@ -1067,7 +1132,7 @@ def _candidate_support_ratio(
         distances = np.linalg.norm(centers - point, axis=1)
         if float(distances.min()) <= tolerance:
             supported += 1
-    return supported / max(points.shape[0], 1)
+    return supported / max(points.shape[0], 1), int(candidates.shape[0])
 
 
 def bundle_adjust_lattice(
@@ -1107,6 +1172,8 @@ def bundle_adjust_lattice(
     threshold = max(float(min_threshold_px), pitch * inlier_threshold_ratio)
 
     def _passthrough(reason: str, support: float | None) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
+        # 平差未执行（证据不足/拟合失败）时不能给出信任背书：
+        # 只有"该规格没有支撑检测器"这一种情况保持 trusted=True。
         info = {
             "applied": False,
             "reason": reason,
@@ -1117,6 +1184,7 @@ def bundle_adjust_lattice(
             "threshold_px": round(threshold, 4),
             "inlier_rmse_px": 0.0,
             "candidate_support_ratio": None if support is None else round(float(support), 6),
+            "support_check": "unavailable" if support is None else "ok",
             "trusted": bool(support is None),
             "observed_ratio": 0.0,
             "mean_confidence": 0.0,
@@ -1139,12 +1207,12 @@ def bundle_adjust_lattice(
     radius_pass1 = radius if radius is not None else max(4, int(pitch * 0.32))
     observed1, status1 = _refine_grid_points_with_status(rectified, points, grid_size, radius_pass1)
     if int(status1.sum()) < min_evidence:
-        support = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch)
         return _passthrough("有效图像观测不足，跳过全局平差", support)
 
     h_first = _fit_homography_irls(lattice_index[status1], observed1[status1].astype(np.float64))
     if h_first is None:
-        support = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch)
         return _passthrough("单应拟合失败", support)
     predicted1 = _apply_homography(h_first, lattice_index).astype(np.float32)
 
@@ -1162,7 +1230,7 @@ def bundle_adjust_lattice(
     residual = np.linalg.norm(observed2.astype(np.float64) - predicted.astype(np.float64), axis=1)
     inlier = status2 & (residual <= threshold)
     if int(inlier.sum()) < min_evidence:
-        support = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch)
         return _passthrough("晶格模型 inlier 不足，跳过全局平差", support)
 
     final_points = points.copy()
@@ -1193,8 +1261,19 @@ def bundle_adjust_lattice(
                 }
             )
 
-    support = _candidate_support_ratio(rectified, final_points, grid_size, pitch)
-    trusted = support is None or support >= 0.6
+    support, candidate_count = _candidate_support_ratio(rectified, final_points, grid_size, pitch)
+    # 支撑率三态判定：
+    # - unavailable：该规格没有候选检测器，检查不适用；
+    # - inconclusive：检测器整体几乎无候选（如重模糊），而能走到这里说明
+    #   逐点精修证据已充分——缺席的是检查手段而非网格质量，不据此判不可信；
+    # - ok：候选充足，支撑率 < 0.6 即判不可信（防规则但错误的网格）。
+    min_check_candidates = max(6, int(expected_count * 0.3))
+    if support is None:
+        trusted, support_check = True, "unavailable"
+    elif candidate_count < min_check_candidates:
+        trusted, support_check = True, "inconclusive"
+    else:
+        trusted, support_check = support >= 0.6, "ok"
     inlier_residual = residual[inlier]
     info: dict[str, object] = {
         "applied": True,
@@ -1206,6 +1285,7 @@ def bundle_adjust_lattice(
         "threshold_px": round(threshold, 4),
         "inlier_rmse_px": round(float(np.sqrt(np.mean(inlier_residual**2))), 6) if inlier_residual.size else 0.0,
         "candidate_support_ratio": None if support is None else round(float(support), 6),
+        "support_check": support_check,
         "trusted": bool(trusted),
         "observed_ratio": round(float(status2.sum()) / expected_count, 6),
         "mean_confidence": round(float(np.mean([m["confidence"] for m in point_meta])), 6),
