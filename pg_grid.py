@@ -781,34 +781,24 @@ def _refine_one_10x10_dark_square_center(
     return best[1], best[2]
 
 
-def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float = 0.085) -> np.ndarray:
-    """在矫正图中拟合阵列点。
+def _legacy_polarity(grid_size: int) -> str:
+    """旧版按网格规格假设的极性（仅作向后兼容默认值）。"""
 
-    15x15 亮点通常表现为亮点；10x10 暗色目标平面上的目标点通常表现为暗色小块。
-    因此这里根据 grid_size 选择亮/暗能量图，再用投影曲线找行列中心。
-    如果投影不可靠，则回退到纯物理规则网格。
-    """
+    return "bright" if grid_size >= 15 else "dark"
 
-    height, width = rectified.shape[:2]
-    gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
 
-    if grid_size == 10:
-        dark_square_grid = _fit_dark_square_grid(rectified, grid_size)
-        if dark_square_grid is not None:
-            return dark_square_grid
+def _fit_axis_projection(
+    gray: np.ndarray,
+    polarity: str,
+    grid_size: int,
+    margin_ratio: float,
+) -> np.ndarray | None:
+    """按指定极性的能量图做行列投影拟合。"""
 
-    if grid_size >= 15:
-        # 亮点候选路径可以处理晶格相对坐标轴的小角度旋转；
-        # 候选不足或规则性不满足时，仍走下面的投影路径。
-        bright_dot_grid = _fit_bright_dot_grid(rectified, grid_size)
-        if bright_dot_grid is not None:
-            return bright_dot_grid
-
-    if grid_size >= 15:
-        # 15x15 亮点：明亮点位是目标。
+    height, width = gray.shape[:2]
+    if polarity == "bright":
         energy = gray.astype(np.float32)
     else:
-        # 10x10 目标平面：小色块/目标点一般比 均匀背景暗。
         energy = 255.0 - gray.astype(np.float32)
 
     # 背景扣除，减弱大面积光照渐变对投影峰的影响。
@@ -818,15 +808,81 @@ def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float =
     background = cv2.GaussianBlur(energy, (blur_size, blur_size), 0)
     enhanced = cv2.normalize(energy - background, None, 0, 255, cv2.NORM_MINMAX)
 
-    x_projection = enhanced.sum(axis=0)
-    y_projection = enhanced.sum(axis=1)
-    xs = _find_axis_centers(x_projection, grid_size, width, margin_ratio)
-    ys = _find_axis_centers(y_projection, grid_size, height, margin_ratio)
-
+    xs = _find_axis_centers(enhanced.sum(axis=0), grid_size, width, margin_ratio)
+    ys = _find_axis_centers(enhanced.sum(axis=1), grid_size, height, margin_ratio)
     if xs is None or ys is None:
-        return generate_grid_points(grid_size, width, height, margin_ratio=margin_ratio)
-
+        return None
     return np.array([[x, y] for y in ys for x in xs], dtype=np.float32)
+
+
+def _estimate_polarity_hint(gray: np.ndarray) -> str:
+    """由图像统计估计单元极性提示。
+
+    阵列单元只占面板面积的少数：背景决定灰度中位数，单元把均值
+    拉向自己一侧（暗单元 -> 均值 < 中位数）。只统计内部区域，
+    避免矫正外扩带来的暗色边缘带干扰。该统计量对模糊不敏感，
+    是候选检测器整体失效时仍然可用的极性证据。
+    """
+
+    height, width = gray.shape[:2]
+    interior = gray[int(height * 0.10):int(height * 0.90), int(width * 0.10):int(width * 0.90)]
+    if interior.size == 0:
+        interior = gray
+    return "dark" if float(interior.mean()) < float(np.median(interior)) else "bright"
+
+
+def _fit_grid_points_with_polarity(
+    rectified: np.ndarray,
+    grid_size: int,
+    margin_ratio: float = 0.085,
+) -> tuple[np.ndarray, str]:
+    """拟合阵列点并自动检测单元极性。
+
+    单元极性（比均匀背景暗还是亮）取决于成像方式而不是网格规格：
+    同一种阵列在背光成像下是"亮面板 + 暗单元"，在反射照明下可能相反。
+
+    决策规则：
+    1. 候选路径两极都尝试（优先数量更接近理论单元数、与统计提示一致
+       的一极），晶格拟合成功即裁决——形状过滤过的候选无法从反极性
+       的间隙结构里凑出合法晶格，误判风险低；
+    2. 投影路径只用统计提示的极性：暗单元阵列的亮间隙同样构成规则
+       投影峰（互补晶格），盲试反极性会得到自信但半格错位的网格；
+    3. 都失败则退回均分网格，极性取统计提示。
+    """
+
+    height, width = rectified.shape[:2]
+    gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+    expected = grid_size * grid_size
+    hint = _estimate_polarity_hint(gray)
+
+    dark_candidates = _detect_dark_square_candidates(rectified)
+    bright_candidates = _detect_bright_dot_candidates(rectified)
+    ordered = sorted(
+        [("dark", dark_candidates), ("bright", bright_candidates)],
+        key=lambda item: (abs(item[1].shape[0] - expected), item[0] != hint),
+    )
+
+    for polarity, candidates in ordered:
+        lattice = _fit_lattice_from_candidates(candidates, grid_size, width, height)
+        if lattice is not None:
+            return lattice, polarity
+
+    projected = _fit_axis_projection(gray, hint, grid_size, margin_ratio)
+    if projected is not None:
+        return projected, hint
+
+    return generate_grid_points(grid_size, width, height, margin_ratio=margin_ratio), hint
+
+
+def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float = 0.085) -> np.ndarray:
+    """在矫正图中拟合阵列点。
+
+    候选晶格路径（含极性自动检测与旋转补偿）优先；投影路径与
+    均分网格作为逐级回退。接口与历史版本保持一致。
+    """
+
+    points, _ = _fit_grid_points_with_polarity(rectified, grid_size, margin_ratio=margin_ratio)
+    return points
 
 
 def _refine_grid_points_with_status(
@@ -834,6 +890,7 @@ def _refine_grid_points_with_status(
     points: np.ndarray,
     grid_size: int,
     radius: int,
+    polarity: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """局部精修，并返回每个点是否获得了图像证据支持。
 
@@ -841,16 +898,21 @@ def _refine_grid_points_with_status(
     （方形组件或质心），False 表示窗口内没有证据或证据被限幅拒绝。
     光束法平差只用有证据的观测拟合全局模型，从机制上避免
     “无证据点占多数时锁定错误网格”的失效模式。
+
+    polarity 指定单元相对背景的明暗极性（None 时沿用旧的按规格假设）。
+    暗单元优先用方形组件精修（对任意网格规格），亮单元用高亮质心。
     """
 
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
     refined = points.copy().astype(np.float32)
     status = np.zeros(points.shape[0], dtype=bool)
-    polarity_bright = grid_size >= 15
+    if polarity is None:
+        polarity = _legacy_polarity(grid_size)
+    polarity_bright = polarity == "bright"
 
     for idx, (x, y) in enumerate(points):
-        if grid_size == 10:
+        if not polarity_bright:
             square_center = _refine_one_10x10_dark_square_center(gray, float(x), float(y), radius)
             if square_center is not None:
                 refined[idx] = square_center
@@ -1105,6 +1167,7 @@ def _candidate_support_ratio(
     points: np.ndarray,
     grid_size: int,
     pitch: float,
+    polarity: str | None = None,
 ) -> tuple[float | None, int]:
     """计算网格点获得真实候选（黑帽/顶帽连通域）支撑的比例。
 
@@ -1115,7 +1178,13 @@ def _candidate_support_ratio(
     ——重模糊等场景下检测器整体失效，比例为 0 不代表网格错误。
     """
 
-    if grid_size == 10:
+    # 极性已知时按极性选检测器（任意网格规格都可校验）；
+    # 未知时沿用旧的按规格映射，保证向后兼容。
+    if polarity == "dark":
+        candidates = _detect_dark_square_candidates(rectified)
+    elif polarity == "bright":
+        candidates = _detect_bright_dot_candidates(rectified)
+    elif grid_size == 10:
         candidates = _detect_dark_square_candidates(rectified)
     elif grid_size >= 15:
         candidates = _detect_bright_dot_candidates(rectified)
@@ -1142,6 +1211,7 @@ def bundle_adjust_lattice(
     inlier_threshold_ratio: float = 0.18,
     min_threshold_px: float = 2.5,
     radius: int | None = None,
+    polarity: str | None = None,
 ) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
     """晶格光束法平差：用全体阵列点共同估计全局单应几何。
 
@@ -1205,20 +1275,20 @@ def bundle_adjust_lattice(
     # 窗口半径优先用调用方给定值（如 process_image 的名义间距公式），
     # 组件精修的几何上限随窗口缩放，窗口过小会把大尺寸单元误拒。
     radius_pass1 = radius if radius is not None else max(4, int(pitch * 0.32))
-    observed1, status1 = _refine_grid_points_with_status(rectified, points, grid_size, radius_pass1)
+    observed1, status1 = _refine_grid_points_with_status(rectified, points, grid_size, radius_pass1, polarity)
     if int(status1.sum()) < min_evidence:
-        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch, polarity)
         return _passthrough("有效图像观测不足，跳过全局平差", support)
 
     h_first = _fit_homography_irls(lattice_index[status1], observed1[status1].astype(np.float64))
     if h_first is None:
-        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch, polarity)
         return _passthrough("单应拟合失败", support)
     predicted1 = _apply_homography(h_first, lattice_index).astype(np.float32)
 
     # 第二轮：以模型预测为中心重新开窗精修。窗口尺寸与第一轮一致：
     # 组件精修的方块尺寸上限随窗口缩放，窗口小于单元会把真实目标拒掉。
-    observed2, status2 = _refine_grid_points_with_status(rectified, predicted1, grid_size, radius_pass1)
+    observed2, status2 = _refine_grid_points_with_status(rectified, predicted1, grid_size, radius_pass1, polarity)
     if int(status2.sum()) >= min_evidence:
         h_final = _fit_homography_irls(lattice_index[status2], observed2[status2].astype(np.float64))
         if h_final is None:
@@ -1230,7 +1300,7 @@ def bundle_adjust_lattice(
     residual = np.linalg.norm(observed2.astype(np.float64) - predicted.astype(np.float64), axis=1)
     inlier = status2 & (residual <= threshold)
     if int(inlier.sum()) < min_evidence:
-        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch)
+        support, _ = _candidate_support_ratio(rectified, points, grid_size, pitch, polarity)
         return _passthrough("晶格模型 inlier 不足，跳过全局平差", support)
 
     final_points = points.copy()
@@ -1261,7 +1331,7 @@ def bundle_adjust_lattice(
                 }
             )
 
-    support, candidate_count = _candidate_support_ratio(rectified, final_points, grid_size, pitch)
+    support, candidate_count = _candidate_support_ratio(rectified, final_points, grid_size, pitch, polarity)
     # 支撑率三态判定：
     # - unavailable：该规格没有候选检测器，检查不适用；
     # - inconclusive：检测器整体几乎无候选（如重模糊），而能走到这里说明
@@ -1519,14 +1589,14 @@ def process_image(
     region = detect_chip_region(original)
     rectified, _, inverse_matrix = rectify_chip(original, region, rectified_size)
 
-    theoretical_points = fit_grid_points(rectified, grid_size, margin_ratio=config.margin_ratio)
+    theoretical_points, unit_polarity = _fit_grid_points_with_polarity(rectified, grid_size, margin_ratio=config.margin_ratio)
     pitch = (rectified_size * (1.0 - 2.0 * config.margin_ratio)) / max(grid_size - 1, 1)
     roi_radius = max(3, int(round(pitch * config.roi_radius_ratio)))
     # V2.0：晶格光束法平差内部完成两轮重定心精修 + 全局单应拟合，
     # 输出逐点置信度/来源，并用候选支撑率做外部证据校验。
     # 窗口半径沿用与历史版本一致的名义间距公式，保持精修行为等价。
     refined_points, lattice_info, point_meta = bundle_adjust_lattice(
-        rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32))
+        rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32)), polarity=unit_polarity
     )
 
     records = extract_roi_measurements(rectified, refined_points, grid_size=grid_size, roi_radius=roi_radius)
@@ -1563,6 +1633,7 @@ def process_image(
         "algorithm": "PG-Grid V2.0 bundle-adjusted localization with PG-Quant V1.0",
         "image_path": str(image_path),
         "grid_size": int(grid_size),
+        "unit_polarity": unit_polarity,
         "point_count": int(len(refined_points)),
         "grid_points": grid_points,
         "lattice_consistency": lattice_info,
