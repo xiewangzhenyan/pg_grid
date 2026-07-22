@@ -25,6 +25,15 @@ No application-specific background is required to use or review this repository.
 
 The current implementation follows this pipeline:
 
+0. Detect unit polarity automatically: whether units are darker or brighter
+   than the panel depends on the imaging mode, not the grid size. Both dark
+   (black-hat) and bright (top-hat) candidates are extracted; lattice-fit
+   success adjudicates, ordered by candidate-count closeness and an
+   interior mean-vs-median statistical hint. The projection fallback uses the
+   statistical hint only — the bright gaps of a dark-unit lattice form a
+   complementary regular lattice, so blindly trying the opposite polarity
+   would yield a confident half-pitch-shifted grid. The decision is recorded
+   in `result.json` as `unit_polarity`.
 1. Locate the main rectangular target region with a two-tier detector: the
    first tier keeps the original high-percentile threshold and small-target
    area prior, and a second tier (Otsu threshold plus a relaxed area limit)

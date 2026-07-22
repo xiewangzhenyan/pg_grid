@@ -321,6 +321,117 @@ def test_fit_grid_points_10x10_handles_rotated_lattice():
     assert float(errors.mean()) < 3.0
 
 
+def _make_polarity_scene(size: int, grid_size: int, start: float, pitch: float,
+                         unit_half: int, background: int, unit_value: int, circular: bool):
+    """构造指定极性的合成矫正图（亮底暗块 或 暗底亮点）。"""
+    import cv2
+
+    image = np.full((size, size, 3), background, dtype=np.uint8)
+    centers = []
+    for row in range(grid_size):
+        for col in range(grid_size):
+            cx = start + col * pitch
+            cy = start + row * pitch
+            if circular:
+                cv2.circle(image, (int(round(cx)), int(round(cy))), unit_half,
+                           (unit_value, unit_value, unit_value), -1)
+                centers.append((round(cx), round(cy)))
+            else:
+                x0 = int(round(cx - unit_half))
+                y0 = int(round(cy - unit_half))
+                image[y0:y0 + 2 * unit_half, x0:x0 + 2 * unit_half] = unit_value
+                centers.append((x0 + unit_half - 0.5, y0 + unit_half - 0.5))
+    return image, np.asarray(centers, dtype=np.float32)
+
+
+def test_fit_grid_points_15x15_dark_units_on_bright_panel():
+    """15x15 也可能是"亮面板 + 暗单元"（背光成像），极性必须自动检测。
+
+    若按旧的"grid>=15 即亮点"假设，投影峰会落在单元间的发光间隙上，
+    整个网格偏移约半个间距。
+    """
+    from pg_grid import fit_grid_points
+
+    image, truth = _make_polarity_scene(
+        size=1200, grid_size=15, start=110.0, pitch=70.0,
+        unit_half=12, background=200, unit_value=90, circular=False,
+    )
+    fitted = fit_grid_points(image, grid_size=15)
+    errors = np.linalg.norm(fitted - truth, axis=1)
+
+    assert fitted.shape == (225, 2)
+    assert float(errors.mean()) < 3.0
+
+
+def test_fit_grid_points_10x10_bright_units_on_dark_panel():
+    """10x10 也可能是"暗面板 + 亮单元"，极性同样必须自动检测。"""
+    from pg_grid import fit_grid_points
+
+    image, truth = _make_polarity_scene(
+        size=800, grid_size=10, start=112.0, pitch=64.0,
+        unit_half=11, background=30, unit_value=220, circular=True,
+    )
+    fitted = fit_grid_points(image, grid_size=10)
+    errors = np.linalg.norm(fitted - truth, axis=1)
+
+    assert fitted.shape == (100, 2)
+    assert float(errors.mean()) < 3.0
+
+
+def test_polarity_not_fooled_by_complementary_lattice_under_blur():
+    """重模糊杀死两个候选检测器时，不得掉进"互补晶格陷阱"。
+
+    暗单元阵列的亮间隙同样构成规则投影峰：盲目尝试反极性投影会得到
+    自信但整体偏移半个间距的网格。极性必须由图像统计提示决定。
+    """
+    import cv2
+    from pg_grid import _fit_grid_points_with_polarity
+
+    image, truth = _make_synthetic_rectified_10x10()
+    blurred = cv2.GaussianBlur(image, (61, 61), 10.0)
+
+    fitted, polarity = _fit_grid_points_with_polarity(blurred, grid_size=10)
+    errors = np.linalg.norm(fitted - truth, axis=1)
+
+    assert polarity == "dark"
+    # 半格错位约为 0.5*pitch=32px；正确结果应远小于 0.25*pitch。
+    assert float(errors.mean()) < 16.0
+
+
+def test_real_photo_10x10_localizes_with_candidate_support(tmp_path):
+    """实拍 10x10 图（EL 背光、含连接器/通道线干扰）必须获得高候选支撑。"""
+    from pg_grid import process_image
+
+    photo = Path(__file__).resolve().parent.parent / "examples" / "手机通过短塔正式拍摄-EL板发光(10×10芯片).jpg"
+    result = process_image(image_path=photo, grid_size=10, output_dir=tmp_path)
+
+    lattice = result["lattice_consistency"]
+    assert result["chip_region"]["method"] != "fallback_center"
+    assert result["point_count"] == 100
+    assert result["unit_polarity"] == "dark"
+    assert lattice["applied"] is True
+    assert lattice["support_check"] == "ok"
+    assert float(lattice["candidate_support_ratio"]) >= 0.75
+    assert lattice["trusted"] is True
+
+
+def test_real_photo_15x15_localizes_with_candidate_support(tmp_path):
+    """实拍 15x15 图（亮面板 + 暗单元）必须被极性检测正确处理并获得支撑。"""
+    from pg_grid import process_image
+
+    photo = Path(__file__).resolve().parent.parent / "examples" / "手机通过短塔正式拍摄-EL板发光(15×15芯片)04.jpg"
+    result = process_image(image_path=photo, grid_size=15, output_dir=tmp_path)
+
+    lattice = result["lattice_consistency"]
+    assert result["chip_region"]["method"] != "fallback_center"
+    assert result["point_count"] == 225
+    assert result["unit_polarity"] == "dark"
+    assert lattice["applied"] is True
+    assert lattice["support_check"] == "ok"
+    assert float(lattice["candidate_support_ratio"]) >= 0.6
+    assert lattice["trusted"] is True
+
+
 def test_refine_grid_points_resists_corner_blob_distractor():
     """10x10 局部精修不得被角落更暗的大块结构（如螺丝/阴影）拉偏。"""
     from pg_grid import refine_grid_points
