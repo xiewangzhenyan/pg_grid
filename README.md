@@ -13,6 +13,9 @@ No application-specific background is required to use or review this repository.
 - `pg_quant_viz.py`: unit-level visualizations (intensity/SNR heatmaps, corrected-color map, reliability overlay).
 - `pg_benchmark.py`: seeded synthetic perturbation benchmark (7 perturbation families) with degradation-curve reports and A/B comparison.
 - `pg_benchmark_demo.py`: command-line benchmark runner and report comparator.
+- `pg_unit_export.py`: per-unit tight cropping — exports every array unit as an
+  individual background-free PNG with a manifest and a contact-sheet
+  verification image.
 - `pg_grid_eval.py`: annotation loading, prediction loading, localization metrics, and report generation.
 - `pg_grid_demo.py`: command-line single-image pipeline runner.
 - `pg_quant_demo.py`: command-line quantification runner based on an existing `result.json`.
@@ -168,6 +171,31 @@ Every pipeline run also renders four unit-level views:
 - `quant_heatmap_snr.jpg`: grid heatmap of per-unit SNR.
 - `quant_color_map.jpg`: each cell filled with the unit's corrected BGR color —
   the most direct view of the per-unit color distribution.
+
+## Per-Unit Crop Export
+
+`pg_unit_export.py` cuts every localized unit out of the rectified image as an
+individual PNG that contains exactly the unit body and no background:
+
+1. **Tight boxes, not fixed windows**: a polarity-aware local segmentation
+   (Otsu inside a window smaller than half the pitch, so a neighbor can never
+   be captured) yields the connected component containing the lattice point,
+   and its tight bounding box is exported.
+2. **Zero missed crops**: the output count always equals `grid_size²`. Units
+   whose segmentation fails (occlusion, weak contrast) fall back to a
+   median-sized box centered on the bundle-adjusted lattice point and are
+   labeled `fallback_median_box` in the manifest.
+3. **Verifiable at a glance**: `crop_manifest.json` records per-unit geometry
+   and source, and `crop_contact_sheet.jpg` tiles all crops in grid order
+   (green border = segmented, red = fallback).
+
+```powershell
+python pg_unit_export.py --result outputs/sample/result.json --output crops/sample
+python pg_unit_export.py --image "examples/photo.jpg" --grid 15 --output crops/photo
+```
+
+On the bundled real 15x15 photo this exports 225/225 crops with zero
+fallbacks; crops are lossless PNGs suitable for downstream per-unit analysis.
 
 ## Perturbation Benchmark and A/B Comparison
 
