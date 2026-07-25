@@ -37,11 +37,20 @@ The current implementation follows this pipeline:
    complementary regular lattice, so blindly trying the opposite polarity
    would yield a confident half-pitch-shifted grid. The decision is recorded
    in `result.json` as `unit_polarity`.
-1. Locate the main rectangular target region with a two-tier detector: the
-   first tier keeps the original high-percentile threshold and small-target
-   area prior, and a second tier (Otsu threshold plus a relaxed area limit)
-   only activates when the first tier finds no candidate, so large panels
-   that fill nearly half of the frame are still detected.
+1. Locate the main rectangular target region with an **area-fraction-agnostic**
+   detector. Candidates are generated at two thresholds — a high percentile
+   (historical behavior, 20% area cap) and Otsu (92% area cap) — and *all* of
+   them are scored together rather than returning as soon as the first tier
+   yields something. Scoring combines area, brightness, and **rectangular fill
+   ratio** (contour area over its min-area-rect area), a purely shape-based
+   criterion that is independent of how much of the frame the target occupies.
+   This matters because a fixed high-percentile threshold implicitly assumes
+   the target covers only a small fraction of the image: crop the background
+   away and the threshold is forced upward until the mask cuts *inside* the
+   panel instead of at its border. Otsu maximizes inter-class variance and
+   presumes no area fraction, so it stays correct whether the target covers
+   12% or 83% of the frame, and the fill ratio distinguishes a complete panel
+   contour (≈0.9–1.0) from a fragment carved out of the panel interior (≈0.5).
 2. Rectify the region into a canonical square view.
 3. Fit a physically constrained grid from blob candidates: black-hat enhanced
    dark squares for 10x10, top-hat enhanced bright dots for 15x15. A small

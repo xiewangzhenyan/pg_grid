@@ -124,21 +124,26 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (9, 9), 0)
 
-    # 大面积黑背景会拉低整体亮度；成像视野圆环又会产生弱反光。
-    # 高分位数阈值只保留均匀背景下真正明亮的目标平面主体，
-    # 但它隐含“目标只占整图一小部分”的假设：目标占比超过 6% 时，
-    # 94 分位会落到目标亮度内部，导致 mask 残缺。
+    # 阈值策略必须与"目标占整图多大比例"无关：用户裁掉四周背景是完全
+    # 合理的操作，但会把目标占比从百分之十几推到百分之八十。
+    #
+    # 高分位阈值按定义只保留最亮的固定比例像素，隐含"目标只占一小部分"
+    # 的假设：背景被裁掉后阈值被迫抬高，掩膜会切在面板内部而不是面板
+    # 边界，检测框严重缩水。Otsu 阈值最大化类间方差、不预设面积比例，
+    # 对"暗背景 + 亮面板"这类双峰分布始终落在两峰之间。
+    #
+    # 因此这里同时评估两种阈值的全部候选并统一评分，而不是"高分位档
+    # 有候选就直接返回"（那样 Otsu 档永远不会被评估——这正是裁切后
+    # 定位塌陷的根因）。
     percentile_threshold = float(np.percentile(blurred, 94))
     otsu_threshold, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 两档尝试：
-    # 第一档沿用高分位阈值 + 20% 面积上限（真实成像视野图中目标约占 5%-12%，
-    # 大于 20% 的候选通常是成像视野圆环或暗箱反光区域），保证既有行为不变；
-    # 第二档仅在第一档无候选时启用：Otsu 阈值对“暗背景 + 大亮面板”类图像
-    # 能把阈值放到背景与面板之间，同时放宽面积上限以接受占近半幅面的目标。
     attempts: list[tuple[float, float, str]] = [
+        # 高分位档：保留历史行为，面积上限 20%（真实成像视野图中目标约占
+        # 5%-12%，更大的候选通常是成像视野圆环或暗箱反光区域）。
         (max(22.0, percentile_threshold), 0.20, "opencv_bright_region"),
-        (max(22.0, min(percentile_threshold, float(otsu_threshold))), 0.65, "opencv_bright_region_wide"),
+        # Otsu 档：面积无关阈值，上限放宽到 92% 以接受被裁到几乎只剩目标的图。
+        (max(22.0, min(percentile_threshold, float(otsu_threshold))), 0.92, "opencv_bright_region_wide"),
     ]
 
     kernel_size = max(7, int(min(width, height) * 0.008))
@@ -147,6 +152,7 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     image_area = width * height
 
+    candidates: list[tuple[float, np.ndarray, str]] = []
     for threshold, max_area_ratio, method in attempts:
         mask = (blurred > threshold).astype(np.uint8) * 255
 
@@ -155,7 +161,6 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
         mask = cv2.dilate(mask, kernel, iterations=1)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates: list[tuple[float, np.ndarray]] = []
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < image_area * 0.002 or area > image_area * max_area_ratio:
@@ -165,30 +170,38 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
             if not 0.35 <= aspect <= 2.8:
                 continue
 
+            rect = cv2.minAreaRect(contour)
+            rect_area = float(rect[1][0] * rect[1][1])
+            if rect_area < 1.0:
+                continue
+            # 矩形填充度：目标平面是矩形，阈值切在边界上时轮廓接近矩形；
+            # 切在目标内部时轮廓沿亮度等值线破碎，填充度显著下降。
+            # 这个判据只看形状，与目标占图比例无关，正是裁切场景所需。
+            fill_ratio = float(area / rect_area)
+
             rect_mask = np.zeros_like(gray, dtype=np.uint8)
             cv2.drawContours(rect_mask, [contour], -1, 255, thickness=-1)
             mean_brightness = cv2.mean(gray, mask=rect_mask)[0]
-            # 分数同时考虑面积和亮度，避免选到暗箱圆环反光。
-            score = math.sqrt(area) * (mean_brightness + 1.0)
-            candidates.append((score, contour))
+            # 分数同时考虑面积、亮度和形状完整性：
+            # 面积和亮度避免选到暗箱圆环反光，填充度避免选到目标内部的碎块。
+            score = math.sqrt(area) * (mean_brightness + 1.0) * (0.35 + 0.65 * fill_ratio)
+            candidates.append((score, contour, method))
 
-        if not candidates:
-            continue
+    if not candidates:
+        return _fallback_center_region(width, height)
 
-        _, best_contour = max(candidates, key=lambda item: item[0])
-        rect = cv2.minAreaRect(best_contour)
-        box = cv2.boxPoints(rect)
-        ordered = order_quad_points(box)
+    _, best_contour, best_method = max(candidates, key=lambda item: item[0])
+    rect = cv2.minAreaRect(best_contour)
+    box = cv2.boxPoints(rect)
+    ordered = order_quad_points(box)
 
-        # 适度外扩，确保目标点和目标平面边缘不会被裁掉。
-        center = ordered.mean(axis=0)
-        expanded = center + (ordered - center) * 1.10
-        expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
-        expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
+    # 适度外扩，确保目标点和目标平面边缘不会被裁掉。
+    center = ordered.mean(axis=0)
+    expanded = center + (ordered - center) * 1.10
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
 
-        return ChipRegion(points=order_quad_points(expanded), score=float(rect[1][0] * rect[1][1]), method=method)
-
-    return _fallback_center_region(width, height)
+    return ChipRegion(points=order_quad_points(expanded), score=float(rect[1][0] * rect[1][1]), method=best_method)
 
 
 def _fallback_center_region(width: int, height: int) -> ChipRegion:
@@ -816,19 +829,63 @@ def _fit_axis_projection(
 
 
 def _estimate_polarity_hint(gray: np.ndarray) -> str:
-    """由图像统计估计单元极性提示。
+    """由图像统计估计单元极性提示（只返回方向，兼容旧调用）。"""
 
-    阵列单元只占面板面积的少数：背景决定灰度中位数，单元把均值
-    拉向自己一侧（暗单元 -> 均值 < 中位数）。只统计内部区域，
-    避免矫正外扩带来的暗色边缘带干扰。该统计量对模糊不敏感，
-    是候选检测器整体失效时仍然可用的极性证据。
+    _, hint = _polarity_hint_with_strength(gray)
+    return hint
+
+
+def _polarity_hint_with_strength(gray: np.ndarray) -> tuple[float, str]:
+    """返回 (提示强度, 极性提示)。
+
+    阵列单元只占面板面积的少数（10x10 约 11%、15x15 约 18%）：背景决定
+    灰度中位数，单元把均值拉向自己一侧（暗单元 -> 均值 < 中位数）。
+    只统计内部区域，避免矫正外扩带来的暗色边缘带干扰。该统计量对模糊
+    不敏感，是候选检测器整体失效时仍然可用的极性证据。
+
+    强度 = |均值 - 中位数|。实测全部样例的符号都正确，但强度差异很大
+    （实拍暗单元 8.9-34.3；小亮点合成图仅 0.9），因此强度决定这条证据
+    能否压过候选数量证据。
     """
 
     height, width = gray.shape[:2]
     interior = gray[int(height * 0.10):int(height * 0.90), int(width * 0.10):int(width * 0.90)]
     if interior.size == 0:
         interior = gray
-    return "dark" if float(interior.mean()) < float(np.median(interior)) else "bright"
+    delta = float(interior.mean()) - float(np.median(interior))
+    return abs(delta), ("dark" if delta < 0 else "bright")
+
+
+# 提示强度显著性门限：实测最弱的正确暗单元提示为 8.9，最强的弱提示
+# （小亮点合成图）为 0.9，取 3.0 兼顾两侧安全边际。
+POLARITY_HINT_SIGNIFICANT = 3.0
+
+
+def _order_polarities_by_evidence(
+    dark_count: int,
+    bright_count: int,
+    expected: int,
+    hint: str,
+    hint_strength: float,
+) -> list[str]:
+    """按证据强度给两种极性排序，返回优先尝试顺序。
+
+    两条证据的可靠性并不对等：
+    - 候选数量接近理论单元数：直觉上合理，但形态学过滤的偶然性让它
+      在实拍图上噪声很大（同一张图不同裁切下亮候选实测 79->164）；
+    - 内部"均值 vs 中位数"统计：物理依据扎实（单元占面积远小于一半），
+      实测符号在全部样例上都正确，但强度可能很弱。
+
+    因此：提示显著时以提示为主键、候选数为次键；提示微弱时反过来。
+    最终裁决仍是"晶格能否拟合成功"，本函数只决定尝试顺序。
+    """
+
+    other = "bright" if hint == "dark" else "dark"
+    gaps = {"dark": abs(dark_count - expected), "bright": abs(bright_count - expected)}
+
+    if hint_strength >= POLARITY_HINT_SIGNIFICANT:
+        return [hint, other]
+    return sorted(("dark", "bright"), key=lambda p: (gaps[p], p != hint))
 
 
 def _fit_grid_points_with_polarity(
@@ -845,33 +902,42 @@ def _fit_grid_points_with_polarity(
     1. 候选路径两极都尝试（优先数量更接近理论单元数、与统计提示一致
        的一极），晶格拟合成功即裁决——形状过滤过的候选无法从反极性
        的间隙结构里凑出合法晶格，误判风险低；
-    2. 投影路径只用统计提示的极性：暗单元阵列的亮间隙同样构成规则
-       投影峰（互补晶格），盲试反极性会得到自信但半格错位的网格；
-    3. 都失败则退回均分网格，极性取统计提示。
+    2. 投影路径只尝试**综合证据排序后的最优极性**（单一极性，不盲试两极）：
+       暗单元阵列的亮间隙同样构成规则投影峰（互补晶格），盲试反极性会
+       得到自信但半格错位的网格。这里必须用综合排序而不是单独的统计
+       提示——重模糊会把提示强度压到接近 0 并可能翻转其符号，此时
+       候选数量才是可靠证据；
+    3. 都失败则退回均分网格，极性取排序后的最优极性。
     """
 
     height, width = rectified.shape[:2]
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     expected = grid_size * grid_size
-    hint = _estimate_polarity_hint(gray)
+    hint_strength, hint = _polarity_hint_with_strength(gray)
 
-    dark_candidates = _detect_dark_square_candidates(rectified)
-    bright_candidates = _detect_bright_dot_candidates(rectified)
-    ordered = sorted(
-        [("dark", dark_candidates), ("bright", bright_candidates)],
-        key=lambda item: (abs(item[1].shape[0] - expected), item[0] != hint),
+    candidates_by_polarity = {
+        "dark": _detect_dark_square_candidates(rectified),
+        "bright": _detect_bright_dot_candidates(rectified),
+    }
+    order = _order_polarities_by_evidence(
+        dark_count=candidates_by_polarity["dark"].shape[0],
+        bright_count=candidates_by_polarity["bright"].shape[0],
+        expected=expected,
+        hint=hint,
+        hint_strength=hint_strength,
     )
 
-    for polarity, candidates in ordered:
-        lattice = _fit_lattice_from_candidates(candidates, grid_size, width, height)
+    for polarity in order:
+        lattice = _fit_lattice_from_candidates(candidates_by_polarity[polarity], grid_size, width, height)
         if lattice is not None:
             return lattice, polarity
 
-    projected = _fit_axis_projection(gray, hint, grid_size, margin_ratio)
+    preferred = order[0]
+    projected = _fit_axis_projection(gray, preferred, grid_size, margin_ratio)
     if projected is not None:
-        return projected, hint
+        return projected, preferred
 
-    return generate_grid_points(grid_size, width, height, margin_ratio=margin_ratio), hint
+    return generate_grid_points(grid_size, width, height, margin_ratio=margin_ratio), preferred
 
 
 def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float = 0.085) -> np.ndarray:
