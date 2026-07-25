@@ -241,10 +241,31 @@ about 20 grey levels (support 0.71, localization 1.98 %pitch, rank fidelity
 0.989) and fails cleanly below roughly 10 grey levels — flagging
 `trusted=false` rather than returning a wrong grid.
 
-Note that self-luminous arrays have no continuous bright panel; the region
-detector handles this with a dedicated emitting-dot-cloud path (outliers
-rejected by nearest-neighbour distance, since hot pixels are isolated while
-array points sit one pitch apart).
+Self-luminous arrays have no continuous bright panel, so region detection
+degrades through two dedicated paths, ordered by how reliable their geometric
+reference is:
+
+1. **Faint substrate contour** (preferred): substrate autofluorescence is often
+   only 1-2 grey levels above the dark background — invisible per pixel, but it
+   covers hundreds of thousands of contiguous pixels. A morphological opening
+   with a structuring element larger than one well erases the bright emitters
+   and leaves the substrate as a plateau that thresholds cleanly. Crucially this
+   reference is *independent of the well intensity distribution*. (Gaussian
+   low-pass does **not** work here — it smears emitter energy onto the
+   substrate and destroys the very contrast being measured: measured 0/24 hits
+   versus 22/24 for opening on the bundled failure cases.)
+2. **Emitting dot cloud**: only lit wells contribute, so when whole rows of dim
+   wells go undetected the box collapses toward the bright side. Outliers are
+   rejected by nearest-neighbour distance — hot pixels are isolated while array
+   points sit one pitch apart.
+
+`examples/fluo/` holds a set of real failure inputs with ground truth, kept as a
+permanent regression test. Its central contract is that the pipeline must never
+fail *silently*: localization may fail on physically hopeless inputs (wells
+below the quantization floor, many dead wells), but such runs must report
+`trusted=false`. This matters because the candidate-support ratio is blind to
+whole-lattice shifts by an integer pitch — a grid displaced by exactly one
+pitch still has 14/15 of its points sitting on real wells.
 
 ## Perturbation Benchmark and A/B Comparison
 

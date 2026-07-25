@@ -179,6 +179,52 @@ def _localization_error(truth_path, result):
     return {"mean_px": float(errors.mean()), "mean_pct_pitch": float(errors.mean() / pitch * 100.0)}
 
 
+def test_bundled_fluo_failure_cases_never_fail_silently(tmp_path):
+    """examples/fluo 的失败样本集：绝不允许"宣称可信但定位错"。
+
+    这是最重要的一条契约——定位失败可以接受（极暗单元、大量失效孔本身
+    就存在物理极限），但算法必须如实报告。历史上这批样本里有 8 例
+    trusted=True 却整体错位一个间距（支撑率对整数格平移是盲的）。
+    同时要求多数样本能被正确定位，防止用"全部报失败"来通过本测试。
+    """
+    import cv2
+    from pg_grid import process_image
+
+    case_dir = Path(__file__).resolve().parent.parent / "examples" / "fluo"
+    cases = sorted(p for p in case_dir.iterdir() if (p / "ground_truth.json").exists())
+    assert len(cases) >= 20, f"失败样本集过小：{len(cases)}"
+
+    silent_failures, accurate = [], 0
+    for case in cases:
+        with (case / "ground_truth.json").open("r", encoding="utf-8") as f:
+            truth = json.load(f)
+        grid_size = int(truth["grid_size"])
+        result = process_image(
+            image_path=case / "input.jpg", grid_size=grid_size, output_dir=tmp_path / case.name
+        )
+
+        region = np.asarray(result["chip_region"]["points"], dtype=np.float32)
+        size = int(result["rectified_size"])
+        matrix = cv2.getPerspectiveTransform(
+            region,
+            np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], dtype=np.float32),
+        )
+        mapped = cv2.perspectiveTransform(
+            np.asarray(truth["points"], dtype=np.float32).reshape(-1, 1, 2), matrix
+        ).reshape(-1, 2)
+        predicted = np.asarray([[p["x"], p["y"]] for p in result["grid_points"]], dtype=np.float64)
+        pitch = max(float(result["lattice_consistency"]["pitch_px"]), 1e-6)
+        error_pct = float(np.linalg.norm(predicted - mapped, axis=1).mean() / pitch * 100.0)
+
+        if error_pct <= 10.0:
+            accurate += 1
+        elif bool(result["lattice_consistency"]["trusted"]):
+            silent_failures.append((case.name, round(error_pct, 1)))
+
+    assert not silent_failures, f"静默错误（trusted 但定位错）：{silent_failures}"
+    assert accurate >= 15, f"仅 {accurate}/{len(cases)} 例被正确定位"
+
+
 def test_evaluate_generated_sample_reports_per_decade_detection(tmp_path):
     """评估入口必须按强度分档报告定位与定量表现。"""
     from pg_fluoro_sim import FluorescenceConfig, evaluate_generated_sample, write_fluorescence_sample
