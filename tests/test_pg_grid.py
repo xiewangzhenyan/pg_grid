@@ -639,6 +639,39 @@ def test_refine_survives_points_far_outside_image():
     assert np.all(np.isfinite(adjusted))
 
 
+def test_select_region_solution_keeps_first_when_margin_is_thin():
+    """分差不足时必须保留首选假设，不做无依据的切换。
+
+    仲裁分只是证据的加权和，本身带噪声；分差零点几个百分点不足以支持
+    换掉按可靠性排在前面的假设。实测有案例在 0.428 vs 0.503 的分差下
+    切换后误差从 118% 恶化到 669%。
+    """
+    from pg_grid import select_region_solution
+
+    first = {"score": 0.62, "tag": "first"}
+    close = {"score": 0.68, "tag": "close"}
+    assert select_region_solution([first, close])["tag"] == "first"
+
+    clear = {"score": 0.85, "tag": "clear"}
+    assert select_region_solution([first, clear])["tag"] == "clear"
+
+
+def test_select_region_solution_keeps_first_when_all_evidence_is_weak():
+    """所有假设证据都弱时保留首选，不把"证据缺失"当成"证据为负"。
+
+    候选检测在某个矫正图里整体失效会让该假设的覆盖率与支撑率同时归零，
+    分数随之归零——但那只说明无从判断，不说明它更差。此时切换是赌博。
+    """
+    from pg_grid import select_region_solution
+
+    dead = {"score": 0.0, "tag": "first_no_evidence"}
+    weak = {"score": 0.47, "tag": "weak"}
+    assert select_region_solution([dead, weak])["tag"] == "first_no_evidence"
+
+    strong = {"score": 0.78, "tag": "strong"}
+    assert select_region_solution([dead, strong])["tag"] == "strong"
+
+
 def test_region_hypotheses_include_both_substrate_and_dot_cloud():
     """荧光图必须同时产出基底轮廓与发光点云两个区域假设供后续仲裁。
 
