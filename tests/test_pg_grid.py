@@ -378,6 +378,100 @@ def test_fit_grid_points_10x10_bright_units_on_dark_panel():
     assert float(errors.mean()) < 3.0
 
 
+def test_polarity_order_prefers_significant_hint_over_marginal_count_gap():
+    """统计提示显著时，不得被噪声级别的候选数差压过。
+
+    实拍图上同一张图的候选数会因形态学过滤的偶然性大幅波动
+    （实测 79→164），而"内部均值 vs 中位数"的提示符号在全部样本上
+    都正确。因此提示显著时它必须是主判据。
+    """
+    from pg_grid import _order_polarities_by_evidence
+
+    # 暗单元真值：提示显著为 dark，但亮候选数偶然更接近理论值。
+    order = _order_polarities_by_evidence(
+        dark_count=93, bright_count=95, expected=100, hint="dark", hint_strength=18.9
+    )
+    assert order[0] == "dark"
+
+    # 提示同样显著时，另一个方向也必须被尊重。
+    order = _order_polarities_by_evidence(
+        dark_count=95, bright_count=93, expected=100, hint="bright", hint_strength=12.0
+    )
+    assert order[0] == "bright"
+
+
+def test_polarity_order_falls_back_to_counts_when_hint_is_weak():
+    """提示很弱时（小亮点、低对比），候选数接近度重新成为主判据。"""
+    from pg_grid import _order_polarities_by_evidence
+
+    # 合成亮点图实测提示仅 +0.93，此时候选数（0 vs 225）才是可靠证据。
+    order = _order_polarities_by_evidence(
+        dark_count=0, bright_count=225, expected=225, hint="bright", hint_strength=0.93
+    )
+    assert order[0] == "bright"
+
+    # 弱提示指向 dark，但候选数强烈指向 bright：应信候选数。
+    order = _order_polarities_by_evidence(
+        dark_count=3, bright_count=224, expected=225, hint="dark", hint_strength=0.5
+    )
+    assert order[0] == "bright"
+
+
+def test_real_photo_10x10_keeps_polarity_when_cropped(tmp_path):
+    """实拍 10x10 第二张图裁到芯片占 35% 时曾极性判反，必须保持正确。"""
+    from pg_grid import detect_chip_region, process_image, read_image_unicode, write_image_unicode
+
+    photo = Path(__file__).resolve().parent.parent / "examples" / "手机通过短塔正式拍摄-EL板发光(10×10芯片)02.jpg"
+    full = read_image_unicode(photo)
+    region = detect_chip_region(full)
+    xs, ys = region.points[:, 0], region.points[:, 1]
+    chip_w = float(xs.max() - xs.min())
+    chip_h = float(ys.max() - ys.min())
+
+    x0 = int(max(0, xs.min() - chip_w * 0.35))
+    y0 = int(max(0, ys.min() - chip_h * 0.35))
+    x1 = int(min(full.shape[1], xs.max() + chip_w * 0.35))
+    y1 = int(min(full.shape[0], ys.max() + chip_h * 0.35))
+    cropped_path = tmp_path / "cropped_02.png"
+    write_image_unicode(cropped_path, full[y0:y1, x0:x1])
+
+    result = process_image(image_path=cropped_path, grid_size=10, output_dir=tmp_path / "out")
+    lattice = result["lattice_consistency"]
+
+    assert result["unit_polarity"] == "dark"
+    assert float(lattice["candidate_support_ratio"]) >= 0.7
+    assert lattice["trusted"] is True
+
+
+def test_bright_units_survive_blur_that_collapses_the_hint():
+    """重模糊把统计提示压到接近 0 时，投影回退必须听候选数证据。
+
+    模糊会让内部均值与中位数几乎重合（实测强度衰减到 0.07），此时提示
+    符号是噪声；若投影回退仍盲信提示，亮点阵列会被当成暗单元处理，
+    落到互补晶格上产生半格错位（Spearman 变负）。
+    """
+    import cv2
+    from pg_grid import _fit_grid_points_with_polarity
+
+    size = 1200
+    image = np.full((size, size, 3), 120, dtype=np.uint8)
+    centers = []
+    for row in range(15):
+        for col in range(15):
+            cx, cy = 110 + col * 70, 110 + row * 70
+            cv2.circle(image, (cx, cy), 8, (215, 215, 215), -1)
+            centers.append((float(cx), float(cy)))
+    centers = np.asarray(centers, dtype=np.float32)
+    blurred = cv2.GaussianBlur(image, (41, 41), 9.0)
+
+    fitted, polarity = _fit_grid_points_with_polarity(blurred, grid_size=15)
+    errors = np.linalg.norm(fitted - centers, axis=1)
+
+    assert polarity == "bright"
+    # 半格错位约 35px；正确结果应远小于此。
+    assert float(errors.mean()) < 12.0
+
+
 def test_polarity_not_fooled_by_complementary_lattice_under_blur():
     """重模糊杀死两个候选检测器时，不得掉进"互补晶格陷阱"。
 
