@@ -443,6 +443,37 @@ def test_real_photo_10x10_keeps_polarity_when_cropped(tmp_path):
     assert lattice["trusted"] is True
 
 
+def test_grid_polarity_contrast_distinguishes_true_lattice_from_complement():
+    """网格-间隙对比度必须能区分真实晶格与互补晶格。
+
+    这是极性歧义的最终仲裁依据：真实晶格的点落在单元上，互补晶格的点
+    落在单元间隙上，两者的"点位 vs 间隙"对比度符号相反。相比候选数量
+    或全局统计量，它直接读取图像在候选网格位置上的证据。
+    """
+    import cv2
+    from pg_grid import _measure_grid_polarity_contrast
+
+    size, pitch, start = 800, 70.0, 95.0
+    image = np.full((size, size, 3), 100, dtype=np.uint8)
+    true_points, shifted_points = [], []
+    for row in range(10):
+        for col in range(10):
+            cx, cy = start + col * pitch, start + row * pitch
+            cv2.circle(image, (int(cx), int(cy)), 12, (220, 220, 220), -1)
+            true_points.append((cx, cy))
+            # 半格错位是投影拟合失误的实际形态（沿单轴偏移半个间距）。
+            shifted_points.append((cx + pitch / 2.0, cy))
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    true_contrast = _measure_grid_polarity_contrast(gray, np.asarray(true_points, dtype=np.float32), 10)
+    shifted_contrast = _measure_grid_polarity_contrast(gray, np.asarray(shifted_points, dtype=np.float32), 10)
+
+    # 亮单元的真实晶格必须给出显著正对比度，且明显强于半格错位的晶格
+    # ——仲裁取的正是"证据更强"的那个。
+    assert true_contrast > 20.0
+    assert shifted_contrast < true_contrast * 0.5
+
+
 def test_bright_units_survive_blur_that_collapses_the_hint():
     """重模糊把统计提示压到接近 0 时，投影回退必须听候选数证据。
 
@@ -562,6 +593,85 @@ def _make_panel_scene(image_w: int, image_h: int, panel_box: tuple[int, int, int
             cy = y0 + int(panel_h * (0.08 + 0.093 * row))
             cv2.rectangle(image, (cx - 5, cy - 5), (cx + 5, cy + 5), (95, 95, 95), -1)
     return image
+
+
+def test_refine_survives_points_far_outside_image():
+    """点位落在图像外时不得崩溃。
+
+    负坐标尤其危险：`min(width, x + radius)` 会得到负数，而 numpy 把
+    负切片索引解释为"从末尾算起"，于是空窗口检查被绕过，随后按字面
+    范围构造索引网格就会因负维度崩溃。极端动态范围下全局模型可能把
+    未被观测到的单元外推到图外，这条路径必须安全。
+    """
+    from pg_grid import bundle_adjust_lattice, refine_grid_points
+
+    # 需要有纹理：均匀图像会让加权质心的权重和为 0 而提前退出，
+    # 掩盖真正的索引越界问题。
+    rng = np.random.default_rng(0)
+    image = rng.integers(20, 200, size=(200, 200, 3), dtype=np.uint8)
+    # 危险区间是"负偏移的绝对值小于图像尺寸"：此时 min(size, x+radius+1)
+    # 得到的负数会被 numpy 当作有效的从末尾计数的索引，切片非空。
+    outside = np.array(
+        [[80.0, -40.0], [-40.0, 80.0], [-30.0, -30.0], [230.0, 90.0], [90.0, 240.0], [50.0, 50.0]],
+        dtype=np.float32,
+    )
+
+    # 亮极性走质心分支（构造索引网格的那条路径）。
+    refined = refine_grid_points(image, outside, grid_size=15, radius=12)
+    assert refined.shape == outside.shape
+    assert np.all(np.isfinite(refined))
+
+    # 暗极性走连通域分支。
+    refined_dark = refine_grid_points(image, outside, grid_size=10, radius=12)
+    assert refined_dark.shape == outside.shape
+    assert np.all(np.isfinite(refined_dark))
+
+    # 平差入口同样不得崩溃（3x3 需要 9 个点）。
+    points = np.array(
+        [[-40.0, -40.0], [90.0, -35.0], [230.0, -30.0],
+         [-35.0, 90.0], [90.0, 90.0], [235.0, 95.0],
+         [-30.0, 230.0], [95.0, 235.0], [240.0, 240.0]],
+        dtype=np.float32,
+    )
+    adjusted, info, meta = bundle_adjust_lattice(image, points, grid_size=3, radius=12, polarity="bright")
+    assert adjusted.shape == points.shape
+    assert len(meta) == points.shape[0]
+    assert np.all(np.isfinite(adjusted))
+
+
+def test_detect_chip_region_handles_emitting_dots_without_bright_panel():
+    """暗背景 + 离散发光点阵列（无连续亮面板）时必须能定出主区域。
+
+    荧光成像下面板本身不发光，只有单元发射：图中最大的连续亮区就是
+    单个发光点（占比远小于面积下限），"找亮矩形区域"的策略完全失效。
+    此时主区域应由发光点云自身的分布决定。
+    """
+    import cv2
+    from pg_grid import detect_chip_region
+
+    size = 1200
+    image = np.full((size, size, 3), 3, dtype=np.uint8)
+    start, pitch = 300.0, 40.0
+    centers = []
+    for row in range(15):
+        for col in range(15):
+            cx = int(round(start + col * pitch))
+            cy = int(round(start + row * pitch))
+            cv2.rectangle(image, (cx - 7, cy - 7), (cx + 7, cy + 7), (30, 210, 60), -1)
+            centers.append((cx, cy))
+    centers = np.asarray(centers, dtype=np.float64)
+
+    region = detect_chip_region(image)
+
+    assert region.method != "fallback_center"
+    xs, ys = region.points[:, 0], region.points[:, 1]
+    # 检测框必须包住整个发光点阵列。
+    assert float(xs.min()) <= centers[:, 0].min() + 8
+    assert float(ys.min()) <= centers[:, 1].min() + 8
+    assert float(xs.max()) >= centers[:, 0].max() - 8
+    assert float(ys.max()) >= centers[:, 1].max() - 8
+    # 且不能过度膨胀（不应该接近整幅图）。
+    assert float(xs.max() - xs.min()) < size * 0.85
 
 
 def test_detect_chip_region_stable_when_background_is_cropped_away():
