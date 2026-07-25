@@ -447,6 +447,99 @@ def test_refine_grid_points_resists_corner_blob_distractor():
     assert abs(float(refined[0, 1]) - 50.0) <= 2.0
 
 
+def _make_panel_scene(image_w: int, image_h: int, panel_box: tuple[int, int, int, int]) -> np.ndarray:
+    """暗背景 + 亮面板（面板内部带亮度不均），用于裁切鲁棒性测试。
+
+    面板内部刻意做出亮度梯度与暗单元：高分位阈值一旦被迫抬高，
+    就会切在面板内部而不是面板边界，从而暴露"阈值依赖目标占图比例"的缺陷。
+    """
+    import cv2
+
+    image = np.full((image_h, image_w, 3), 10, dtype=np.uint8)
+    x0, y0, x1, y1 = panel_box
+    panel_w, panel_h = x1 - x0, y1 - y0
+    ramp = np.linspace(190, 245, panel_w, dtype=np.float64)
+    panel = np.repeat(ramp[None, :], panel_h, axis=0)
+    image[y0:y1, x0:x1] = np.stack([panel] * 3, axis=2).astype(np.uint8)
+    # 面板内规则暗单元，进一步破坏"面板内部一致明亮"的假设。
+    for row in range(10):
+        for col in range(10):
+            cx = x0 + int(panel_w * (0.08 + 0.093 * col))
+            cy = y0 + int(panel_h * (0.08 + 0.093 * row))
+            cv2.rectangle(image, (cx - 5, cy - 5), (cx + 5, cy + 5), (95, 95, 95), -1)
+    return image
+
+
+def test_detect_chip_region_stable_when_background_is_cropped_away():
+    """裁掉四周背景不得改变主区域检测结果。
+
+    人工裁切是完全合理的操作（甚至减少了干扰），但固定高分位阈值隐含
+    "目标只占整图一小部分"的假设：背景被裁掉后阈值被迫抬高，掩膜会
+    切在面板内部而非面板边界。检测必须对目标占图比例不敏感。
+    """
+    from pg_grid import detect_chip_region
+
+    panel_box = (700, 700, 1700, 1700)
+    full = _make_panel_scene(2400, 2400, panel_box)
+    panel_w = panel_h = 1000
+
+    reference = detect_chip_region(full)
+    ref_xs, ref_ys = reference.points[:, 0], reference.points[:, 1]
+    ref_size = (float(ref_xs.max() - ref_xs.min()) + float(ref_ys.max() - ref_ys.min())) / 2.0
+    assert reference.method != "fallback_center"
+    # 未裁切时检测框应覆盖整个面板（含 1.10 外扩，允许 15% 容差）。
+    assert abs(ref_size - panel_w * 1.10) < panel_w * 0.15
+
+    # 逐级裁掉背景：面板占比从 17% 一路升到 78%。
+    for pad in (400, 200, 100, 60):
+        x0, y0 = panel_box[0] - pad, panel_box[1] - pad
+        x1, y1 = panel_box[2] + pad, panel_box[3] + pad
+        cropped = full[y0:y1, x0:x1]
+        region = detect_chip_region(cropped)
+        assert region.method != "fallback_center", pad
+
+        xs, ys = region.points[:, 0], region.points[:, 1]
+        size = (float(xs.max() - xs.min()) + float(ys.max() - ys.min())) / 2.0
+        # 检测框尺寸必须与未裁切时一致（面板本身没变），容差 12%。
+        assert abs(size - ref_size) < ref_size * 0.12, (pad, size, ref_size)
+        # 检测框中心必须落在面板中心附近。
+        center_x = (float(xs.min()) + float(xs.max())) / 2.0
+        center_y = (float(ys.min()) + float(ys.max())) / 2.0
+        expected_x = panel_box[0] - x0 + panel_w / 2.0
+        expected_y = panel_box[1] - y0 + panel_h / 2.0
+        assert math.hypot(center_x - expected_x, center_y - expected_y) < panel_w * 0.06, pad
+
+
+def test_real_photo_localization_survives_background_cropping(tmp_path):
+    """实拍图裁掉四周背景后，定位质量不得塌陷。"""
+    import cv2
+    from pg_grid import detect_chip_region, process_image, read_image_unicode, write_image_unicode
+
+    photo = Path(__file__).resolve().parent.parent / "examples" / "手机通过短塔正式拍摄-EL板发光(15×15芯片).jpg"
+    full = read_image_unicode(photo)
+    region = detect_chip_region(full)
+    xs, ys = region.points[:, 0], region.points[:, 1]
+    chip_w = float(xs.max() - xs.min())
+    chip_h = float(ys.max() - ys.min())
+
+    # 只保留芯片外 10% 芯片尺寸的背景：芯片占裁切图约 70%。
+    x0 = int(max(0, xs.min() - chip_w * 0.10))
+    y0 = int(max(0, ys.min() - chip_h * 0.10))
+    x1 = int(min(full.shape[1], xs.max() + chip_w * 0.10))
+    y1 = int(min(full.shape[0], ys.max() + chip_h * 0.10))
+    cropped_path = tmp_path / "cropped.png"
+    write_image_unicode(cropped_path, full[y0:y1, x0:x1])
+
+    result = process_image(image_path=cropped_path, grid_size=15, output_dir=tmp_path / "out")
+    lattice = result["lattice_consistency"]
+
+    assert result["chip_region"]["method"] != "fallback_center"
+    assert result["unit_polarity"] == "dark"
+    assert float(lattice["candidate_support_ratio"]) >= 0.85
+    assert lattice["trusted"] is True
+    assert float(lattice["mean_confidence"]) >= 0.85
+
+
 def test_detect_chip_region_finds_large_rotated_panel():
     """主区域检测必须能处理占近半幅面的旋转亮面板，而不是落入中央兜底框。"""
     import cv2
