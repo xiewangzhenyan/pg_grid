@@ -163,7 +163,12 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < image_area * 0.002 or area > image_area * max_area_ratio:
+            # 面积下限 1%：一个能容纳整个阵列的目标面板不可能更小。
+            # 这条下限专门挡住"只有少数单元很亮时它们连成的小块"——实测
+            # 荧光样本里这种误检只占整图 0.6%，一旦被采用，真值几乎全部
+            # 落到矫正图外。实际场景的占比都远高于此（实拍 12%-14%、
+            # 合成样例约 46%、基准场景 5.4%），因此这条门限不会误伤。
+            if area < image_area * 0.010 or area > image_area * max_area_ratio:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
             aspect = w / max(h, 1)
@@ -190,7 +195,13 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
     if not candidates:
         # 没有连续亮区：荧光/自发光成像下面板本身不发光，只有单元发射，
         # 图中最大的连续亮区就是单个发光点，面积远低于目标区域门限。
-        # 此时改由发光点云自身的分布界定主区域。
+        #
+        # 退化顺序按"几何参考的可靠性"排列：
+        # 1. 微弱基底轮廓——独立于单元亮度分布，最可靠；
+        # 2. 发光点云——只有亮单元参与，暗单元成片缺失时框会偏向亮的一侧。
+        substrate_region = _detect_region_from_faint_substrate(gray, width, height)
+        if substrate_region is not None:
+            return substrate_region
         dot_region = _detect_region_from_emitting_dots(gray, width, height)
         if dot_region is not None:
             return dot_region
@@ -208,6 +219,67 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
     expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
 
     return ChipRegion(points=order_quad_points(expanded), score=float(rect[1][0] * rect[1][1]), method=best_method)
+
+
+def _detect_region_from_faint_substrate(gray: np.ndarray, width: int, height: int) -> ChipRegion | None:
+    """由发光单元下方的微弱基底轮廓界定主区域（荧光成像首选路径）。
+
+    荧光成像中基底自发荧光通常只比暗背景亮 1-2 个灰度级，单像素上完全
+    淹没在噪声里；但它是几十万像素的**连续区域**，只要先把亮单元擦掉、
+    再做空间平均，这点差异就足够分离。
+
+    为什么用形态学开运算而不是低通滤波：高斯模糊会把亮单元的能量摊到
+    基底上，反而抬高基底读数、破坏基底与背景的对比（实测低通方案在
+    真实失败样本上 0/24 命中，开运算 22/24）。开运算的结构元只要大于
+    单元尺寸，亮单元就被整体腐蚀掉，基底作为大面积平台被保留。
+
+    这个几何参考的关键优势是**独立于单元亮度分布**：发光点云路径会因为
+    暗单元检测不到而把框缩到亮单元那一侧，基底轮廓不会。
+    """
+
+    side = min(width, height)
+    # 结构元必须大于单元尺寸，否则单元擦不干净。
+    kernel_size = max(21, int(side * 0.030)) | 1
+    opened = cv2.morphologyEx(
+        gray, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    )
+    # 中值滤波压掉残余噪声，再按分位数拉伸——基底与背景的差异往
+    # 往只有个位数灰度级，不拉伸则 Otsu 无法工作。
+    denoised = cv2.medianBlur(opened, 9)
+    low = float(np.percentile(denoised, 2))
+    high = float(np.percentile(denoised, 98))
+    if high - low < 1.0:
+        return None
+    normalized = np.clip((denoised.astype(np.float32) - low) / (high - low) * 255.0, 0, 255).astype(np.uint8)
+
+    threshold, _ = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, mask = cv2.threshold(normalized, float(threshold), 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((kernel_size, kernel_size), np.uint8))
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    best = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(best))
+    image_area = float(width * height)
+    if area < image_area * 0.05 or area > image_area * 0.95:
+        return None
+
+    rect = cv2.minAreaRect(best)
+    aspect = rect[1][0] / max(rect[1][1], 1e-6)
+    if not 0.35 <= aspect <= 2.8:
+        return None
+
+    ordered = order_quad_points(cv2.boxPoints(rect))
+    # 基底轮廓已经是面板边界（不像点云那样贴着最外圈单元中心），
+    # 因此只做与亮面板路径一致的小幅外扩。
+    center = ordered.mean(axis=0)
+    expanded = center + (ordered - center) * 1.02
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
+    return ChipRegion(
+        points=order_quad_points(expanded), score=area, method="opencv_faint_substrate"
+    )
 
 
 def _multi_threshold_blobs(

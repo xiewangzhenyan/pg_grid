@@ -639,6 +639,78 @@ def test_refine_survives_points_far_outside_image():
     assert np.all(np.isfinite(adjusted))
 
 
+def test_detect_chip_region_rejects_tiny_bright_cluster_in_favour_of_substrate():
+    """极小的亮块不得被当作目标区域，应让位给微弱基底轮廓。
+
+    这是 examples/fluo 里的真实失败样本：只有少数单元很亮时它们连成
+    一小块（实测占整图 0.6%）通过了亮区路径，而能容纳整个阵列的目标
+    面板不可能只占这么小。真值曾因此几乎全部落在矫正图之外。
+    """
+    import json
+
+    import cv2
+    from pg_grid import detect_chip_region, read_image_unicode
+
+    case = Path(__file__).resolve().parent.parent / "examples" / "fluo" / "region_collapse_extreme_0025"
+    image = read_image_unicode(case / "input.jpg")
+    with (case / "ground_truth.json").open("r", encoding="utf-8") as f:
+        truth = json.load(f)
+    points = np.asarray(truth["points"], dtype=np.float64)
+
+    region = detect_chip_region(image)
+    xs, ys = region.points[:, 0], region.points[:, 1]
+
+    # 框必须包住整个阵列，而不是最亮的那一小簇。
+    assert float(xs.min()) <= points[:, 0].min()
+    assert float(ys.min()) <= points[:, 1].min()
+    assert float(xs.max()) >= points[:, 0].max()
+    assert float(ys.max()) >= points[:, 1].max()
+
+
+def test_detect_chip_region_finds_faint_substrate_under_bright_emitters():
+    """发光阵列下方的微弱基底轮廓必须能被检出，且优先于发光点云。
+
+    荧光成像里基底自发荧光只比暗背景亮 1-2 个灰度级，单像素上淹没在
+    噪声里；但它是几十万像素的连续区域，用大于单元尺寸的形态学开运算
+    擦掉亮单元后即可分离。这个几何参考独立于单元亮度分布——发光点云
+    路径会因为暗单元检测不到而框偏，基底轮廓不会。
+    """
+    import cv2
+    from pg_grid import detect_chip_region
+
+    size = 1400
+    rng = np.random.default_rng(3)
+    image = rng.normal(0.6, 0.5, (size, size, 3)).clip(0, 255).astype(np.uint8)
+    # 基底：只比背景亮约 2 个灰度级。
+    panel_x0, panel_y0, panel_side = 400, 400, 620
+    image[panel_y0:panel_y0 + panel_side, panel_x0:panel_x0 + panel_side] += 2
+
+    # 发光单元：亮度沿行递增，最上面几行接近背景（检测不到）。
+    margin, grid_size = 52.0, 15
+    pitch = (panel_side - 2 * margin) / (grid_size - 1)
+    centers = []
+    for row in range(grid_size):
+        level = int(2 + 240 * (row / (grid_size - 1)) ** 2)
+        for col in range(grid_size):
+            cx = int(round(panel_x0 + margin + col * pitch))
+            cy = int(round(panel_y0 + margin + row * pitch))
+            cv2.rectangle(image, (cx - 8, cy - 8), (cx + 8, cy + 8), (level, level, level), -1)
+            centers.append((cx, cy))
+    centers = np.asarray(centers, dtype=np.float64)
+
+    region = detect_chip_region(image)
+
+    assert region.method == "opencv_faint_substrate", region.method
+    xs, ys = region.points[:, 0], region.points[:, 1]
+    # 必须完整包住整个阵列（含最暗的首行），四边都要有余量。
+    assert float(xs.min()) <= centers[:, 0].min()
+    assert float(ys.min()) <= centers[:, 1].min()
+    assert float(xs.max()) >= centers[:, 0].max()
+    assert float(ys.max()) >= centers[:, 1].max()
+    # 且贴合面板而非整幅图。
+    assert float(xs.max() - xs.min()) < panel_side * 1.5
+
+
 def test_detect_chip_region_handles_emitting_dots_without_bright_panel():
     """暗背景 + 离散发光点阵列（无连续亮面板）时必须能定出主区域。
 
