@@ -196,9 +196,8 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
         # 没有连续亮区：荧光/自发光成像下面板本身不发光，只有单元发射，
         # 图中最大的连续亮区就是单个发光点，面积远低于目标区域门限。
         #
-        # 退化顺序按"几何参考的可靠性"排列：
-        # 1. 微弱基底轮廓——独立于单元亮度分布，最可靠；
-        # 2. 发光点云——只有亮单元参与，暗单元成片缺失时框会偏向亮的一侧。
+        # 这里返回单一结果时按可靠性排序退化；需要多假设仲裁的调用方
+        # 请用 enumerate_region_hypotheses（process_image 走那条路径）。
         substrate_region = _detect_region_from_faint_substrate(gray, width, height)
         if substrate_region is not None:
             return substrate_region
@@ -423,6 +422,94 @@ def _detect_region_from_emitting_dots(gray: np.ndarray, width: int, height: int)
     )
 
 
+def enumerate_region_hypotheses(image: np.ndarray) -> list[ChipRegion]:
+    """列出全部可用的主区域假设，供调用方用图像证据仲裁。
+
+    为什么不固定优先级：三条路径各有系统性偏好，没有一条在所有成像
+    条件下占优。
+    - 亮区候选：面板本身可见时最准，荧光下常常抓到局部亮块；
+    - 微弱基底轮廓：独立于单元亮度分布，但会被棋盘/稀疏图案以及
+      不均匀基底带偏；
+    - 发光点云：基底完全不可见时的唯一线索，但只有亮单元参与，
+      暗单元成片缺失时框会偏向亮的一侧。
+    因此把假设都列出来，由下游各自完成晶格拟合后按证据择优
+    （见 process_image 的联合选择）。兜底框不在此列——它不是证据，
+    是所有假设都失败时的最后手段。
+    """
+
+    if image.ndim != 3:
+        raise ValueError("enumerate_region_hypotheses 需要 BGR 彩色图像")
+
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    hypotheses: list[ChipRegion] = []
+    seen: set[str] = set()
+
+    primary = detect_chip_region(image)
+    if primary.method != "fallback_center":
+        hypotheses.append(primary)
+        seen.add(primary.method)
+
+    for builder in (_detect_region_from_faint_substrate, _detect_region_from_emitting_dots):
+        region = builder(gray, width, height)
+        if region is not None and region.method not in seen:
+            hypotheses.append(region)
+            seen.add(region.method)
+    return hypotheses
+
+
+def measure_grid_coverage_ratio(
+    image: np.ndarray,
+    points: np.ndarray,
+    polarity: str,
+    pitch: float,
+    scale_side: float | None = None,
+) -> float:
+    """图中被检测到的单元有多大比例被网格覆盖。
+
+    这是候选支撑率的**反方向**判据，两者合起来才完整：
+    - 支撑率问"网格点旁边有没有真实单元"，对被区域框切掉的整行无感
+      ——那些单元根本没进矫正图，也就不会有网格点去问它们；
+    - 包围率问"图里检测到的单元有没有被网格覆盖"，因此能直接抓住
+      区域框截断：只要视野比区域框大，被切掉的单元照样会被检测到，
+      却找不到覆盖它们的网格点。
+
+    因此调用方应传入**比区域框更大的视野**（见 _solve_with_region 的
+    扩展矫正图），并用 scale_side 保持几何门限与矫正图尺度一致。
+    """
+
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if points.shape[0] == 0:
+        return 0.0
+
+    if polarity == "dark":
+        candidates = _detect_dark_square_candidates(image, scale_side)
+    else:
+        candidates = _detect_bright_dot_candidates(image, scale_side)
+    if candidates.shape[0] == 0:
+        return 0.0
+
+    # 只统计紧邻网格的候选：判据要回答的是"区域框外还有没有本该属于
+    # 阵列的单元"，而不是"图里还有没有别的亮/暗结构"。远处的连接器、
+    # 螺丝、反光与阵列无关，把它们计入会让包围率无谓地偏低。
+    lo = points.min(axis=0) - 1.5 * float(pitch)
+    hi = points.max(axis=0) + 1.5 * float(pitch)
+    centers = candidates[:, :2].astype(np.float64)
+    near = np.all((centers >= lo) & (centers <= hi), axis=1)
+    if not near.any():
+        return 0.0
+    centers = centers[near]
+
+    tolerance = max(3.0, float(pitch) * 0.35)
+    covered = 0
+    for cx, cy in centers:
+        distances = np.linalg.norm(points - (cx, cy), axis=1)
+        if float(distances.min()) <= tolerance:
+            covered += 1
+    return covered / float(centers.shape[0])
+
+
 def _fallback_center_region(width: int, height: int) -> ChipRegion:
     """目标平面定位失败时使用中央兜底区域。
 
@@ -554,7 +641,7 @@ def _find_axis_centers(projection: np.ndarray, count: int, length: int, margin_r
     return centers
 
 
-def _detect_dark_square_candidates(rectified: np.ndarray) -> np.ndarray:
+def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | None = None) -> np.ndarray:
     """定位 10x10 暗色目标平面中的暗色方形反应区候选点。
 
     10x10 实拍图里的有效定位目标不是目标平面外框，而是每个通道上的灰色小方块。
@@ -566,7 +653,9 @@ def _detect_dark_square_candidates(rectified: np.ndarray) -> np.ndarray:
 
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
-    side = min(width, height)
+    # scale_side 允许在扩展画布上沿用原矫正图的尺度门限：画布放大但
+    # 单元像素尺寸不变，若跟着画布放大门限会把真实单元全部过滤掉。
+    side = float(scale_side) if scale_side else min(width, height)
 
     # 核尺寸要大于反应方块，这样黑帽变换会突出方块而不是大面积背景渐变。
     kernel_size = max(31, int(side * 0.065))
@@ -610,7 +699,7 @@ def _detect_dark_square_candidates(rectified: np.ndarray) -> np.ndarray:
     return np.asarray(candidates, dtype=np.float32)
 
 
-def _detect_bright_dot_candidates(rectified: np.ndarray) -> np.ndarray:
+def _detect_bright_dot_candidates(rectified: np.ndarray, scale_side: float | None = None) -> np.ndarray:
     """定位 15x15 亮点阵列中的小亮斑候选点。
 
     与 10x10 暗方块检测对偶：用顶帽变换（top-hat）增强“小而亮”的结构，
@@ -622,7 +711,7 @@ def _detect_bright_dot_candidates(rectified: np.ndarray) -> np.ndarray:
 
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
-    side = min(width, height)
+    side = float(scale_side) if scale_side else min(width, height)
 
     # 核尺寸要大于亮点直径，顶帽变换才会保留整个亮点而不是只留边缘。
     kernel_size = max(25, int(side * 0.050))
@@ -1916,6 +2005,62 @@ def _default_rectified_size(grid_size: int) -> int:
     return int(max(720, min(1600, grid_size * 80)))
 
 
+def _solve_with_region(
+    original: np.ndarray,
+    region: ChipRegion,
+    grid_size: int,
+    rectified_size: int,
+    config: PipelineConfig,
+    pitch: float,
+) -> dict[str, object]:
+    """在给定主区域假设下走完整条几何链路，并给出可比较的证据分。
+
+    评分融合三项互补证据（都已归一到 0-1）：
+    - coverage：原图中已检出单元被网格覆盖的比例，抓"区域框截断"；
+    - support：网格点有真实单元支撑的比例，抓"网格整体错位/虚构"；
+    - observed：获得局部图像证据的点位比例，抓"拟合缺乏观测支撑"。
+    再按晶格残差（相对间距）扣分，抓"勉强拟合但几何变形"。
+    """
+
+    rectified, _, inverse_matrix = rectify_chip(original, region, rectified_size)
+    points, polarity = _fit_grid_points_with_polarity(rectified, grid_size, margin_ratio=config.margin_ratio)
+    refined, lattice_info, point_meta = bundle_adjust_lattice(
+        rectified, points, grid_size, radius=max(4, int(pitch * 0.32)), polarity=polarity
+    )
+
+    # 包围率在"扩展矫正图"里测量：沿用同一单应，但输出画布放大，
+    # 使区域框之外的一圈也进入视野。若区域框截断了阵列，被切掉的单元
+    # 会出现在这圈里且没有网格点覆盖，包围率随之下降。
+    # 单元的像素尺寸不随画布变化，因此几何门限要用原矫正图尺度
+    # （scale_side），否则真实单元会被放大后的门限全部过滤掉。
+    expand = 1.4
+    expanded_size = int(round(rectified_size * expand))
+    offset = (expanded_size - rectified_size) / 2.0
+    dst = np.array(
+        [[offset, offset], [offset + rectified_size - 1, offset],
+         [offset + rectified_size - 1, offset + rectified_size - 1], [offset, offset + rectified_size - 1]],
+        dtype=np.float32,
+    )
+    expanded_matrix = cv2.getPerspectiveTransform(region.points.astype(np.float32), dst)
+    expanded = cv2.warpPerspective(original, expanded_matrix, (expanded_size, expanded_size), flags=cv2.INTER_LINEAR)
+    coverage = measure_grid_coverage_ratio(
+        expanded, refined.astype(np.float64) + offset, polarity,
+        max(float(lattice_info.get("pitch_px", pitch)), 1.0), scale_side=rectified_size,
+    )
+
+    support = lattice_info.get("candidate_support_ratio")
+    support_value = 1.0 if support is None else float(support)
+    observed = float(lattice_info.get("observed_ratio", 0.0))
+    rmse_ratio = float(lattice_info.get("inlier_rmse_px", 0.0)) / max(float(lattice_info.get("pitch_px", pitch)), 1e-6)
+    score = 0.45 * coverage + 0.35 * support_value + 0.20 * observed - min(rmse_ratio, 0.5)
+
+    return {
+        "region": region, "rectified": rectified, "inverse_matrix": inverse_matrix,
+        "polarity": polarity, "points": refined, "point_meta": point_meta,
+        "lattice_info": lattice_info, "coverage": coverage, "score": score,
+    }
+
+
 def process_image(
     image_path: str | Path,
     grid_size: int,
@@ -1936,18 +2081,51 @@ def process_image(
     original = read_image_unicode(image_path)
     rectified_size = config.rectified_size or _default_rectified_size(grid_size)
 
-    region = detect_chip_region(original)
-    rectified, _, inverse_matrix = rectify_chip(original, region, rectified_size)
-
-    theoretical_points, unit_polarity = _fit_grid_points_with_polarity(rectified, grid_size, margin_ratio=config.margin_ratio)
     pitch = (rectified_size * (1.0 - 2.0 * config.margin_ratio)) / max(grid_size - 1, 1)
     roi_radius = max(3, int(round(pitch * config.roi_radius_ratio)))
-    # V2.0：晶格光束法平差内部完成两轮重定心精修 + 全局单应拟合，
-    # 输出逐点置信度/来源，并用候选支撑率做外部证据校验。
-    # 窗口半径沿用与历史版本一致的名义间距公式，保持精修行为等价。
-    refined_points, lattice_info, point_meta = bundle_adjust_lattice(
-        rectified, theoretical_points, grid_size, radius=max(4, int(pitch * 0.32)), polarity=unit_polarity
-    )
+
+    # V2.1：区域假设联合选择。
+    # 三条区域检测路径各有系统性偏好，没有一条在所有成像条件下占优，
+    # 因此不按固定优先级取一条，而是让每个假设各自走完晶格拟合，
+    # 再用图像证据择优——与本管线在主区域阈值、单元极性上已经采用的
+    # 做法一致（都是"生成多个假设 + 用证据仲裁"，而不是预设顺序）。
+    solutions = []
+    for candidate_region in enumerate_region_hypotheses(original) or [detect_chip_region(original)]:
+        solution = _solve_with_region(original, candidate_region, grid_size, rectified_size, config, pitch)
+        solutions.append(solution)
+        # 短路：证据已经很强时不必再算其余假设，省去重复的矫正与拟合。
+        if solution["coverage"] >= 0.95 and solution["lattice_info"]["candidate_support_ratio"] is not None \
+                and float(solution["lattice_info"]["candidate_support_ratio"]) >= 0.90:
+            break
+
+    best = max(solutions, key=lambda item: item["score"])
+    region = best["region"]
+    rectified = best["rectified"]
+    inverse_matrix = best["inverse_matrix"]
+    unit_polarity = best["polarity"]
+    refined_points = best["points"]
+    point_meta = best["point_meta"]
+    lattice_info = dict(best["lattice_info"])
+    lattice_info["grid_coverage_ratio"] = round(float(best["coverage"]), 6)
+    lattice_info["region_hypotheses"] = [
+        {
+            "method": str(s["region"].method),
+            "coverage": round(float(s["coverage"]), 4),
+            "support": None if s["lattice_info"]["candidate_support_ratio"] is None
+            else round(float(s["lattice_info"]["candidate_support_ratio"]), 4),
+            "score": round(float(s["score"]), 4),
+            "selected": s is best,
+        }
+        for s in solutions
+    ]
+    # 包围率参与信任判定，但只用很保守的门限。
+    # 它的绝对值有图像相关的基线：单元之外还有连接器、通道线等结构的
+    # 版型（实测 10x10 实拍图 0.84-0.90）天然低于纯净版型（15x15 为
+    # 0.99-1.00），因此高门限会误伤正确结果。0.55 只拦截"网格漏掉了
+    # 近半已检出单元"这类明显截断；细粒度的优劣留给假设间的相对比较。
+    if best["coverage"] < 0.55 and lattice_info.get("support_check") != "unavailable":
+        lattice_info["trusted"] = False
+        lattice_info["reason"] = "网格未覆盖邻域内足够多的已检出单元"
 
     records = extract_roi_measurements(rectified, refined_points, grid_size=grid_size, roi_radius=roi_radius)
     quality = evaluate_quality(original, rectified, records, geometry_info=lattice_info)

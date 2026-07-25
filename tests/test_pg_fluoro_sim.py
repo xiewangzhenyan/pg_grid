@@ -179,6 +179,38 @@ def _localization_error(truth_path, result):
     return {"mean_px": float(errors.mean()), "mean_pct_pitch": float(errors.mean() / pitch * 100.0)}
 
 
+def test_region_selection_is_not_dominated_by_one_hypothesis(tmp_path):
+    """区域假设必须由证据选出，不能由某一条路径垄断。
+
+    固定优先级的症状是"某条路径被用在几乎所有图上"——那说明它是被
+    顺序选中的，而不是被证据选中的。这里要求在失败样本集上至少有两条
+    路径各自胜出过，且诊断里记录了完整的假设比较过程。
+    """
+    from pg_grid import process_image
+
+    case_dir = Path(__file__).resolve().parent.parent / "examples" / "fluo"
+    cases = sorted(p for p in case_dir.iterdir() if (p / "ground_truth.json").exists())[:12]
+
+    chosen, multi_hypothesis = [], 0
+    for case in cases:
+        with (case / "ground_truth.json").open("r", encoding="utf-8") as f:
+            grid_size = int(json.load(f)["grid_size"])
+        result = process_image(
+            image_path=case / "input.jpg", grid_size=grid_size, output_dir=tmp_path / case.name
+        )
+        lattice = result["lattice_consistency"]
+        hypotheses = lattice.get("region_hypotheses", [])
+        assert hypotheses, "诊断中必须记录区域假设比较过程"
+        assert sum(1 for h in hypotheses if h["selected"]) == 1
+        assert "grid_coverage_ratio" in lattice
+        chosen.append(result["chip_region"]["method"])
+        if len(hypotheses) > 1:
+            multi_hypothesis += 1
+
+    assert multi_hypothesis >= 6, "多数样本应至少产出两个可比较的区域假设"
+    assert len(set(chosen)) >= 2, f"区域路径被单一假设垄断：{set(chosen)}"
+
+
 def test_bundled_fluo_failure_cases_never_fail_silently(tmp_path):
     """examples/fluo 的失败样本集：绝不允许"宣称可信但定位错"。
 
