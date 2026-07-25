@@ -259,6 +259,28 @@ reference is:
    rejected by nearest-neighbour distance — hot pixels are isolated while array
    points sit one pitch apart.
 
+These hypotheses are **not** applied in a fixed priority order. Each one is
+carried all the way through rectification and lattice fitting, and the winner is
+chosen by evidence — the same "generate several hypotheses, let evidence
+arbitrate" pattern this pipeline already uses for the region threshold and for
+unit polarity. The scoring combines three complementary signals:
+
+- **candidate support**: what fraction of grid points sit on a real detected
+  unit — catches a grid that is displaced or invented;
+- **grid coverage**: what fraction of units detected *in a widened field of
+  view* are covered by the grid — the reverse direction, and the only one that
+  catches a region box that truncated part of the array (truncated units are
+  still visible in the widened view but have no grid point on them);
+- **observed ratio**: what fraction of points obtained local image evidence.
+
+Coverage is measured on an expanded rectification (same homography, larger
+canvas) so units just outside the region box enter the field of view while
+their pixel size — and therefore the detector's geometric gates — stay
+unchanged. Note its absolute value is layout-dependent (real 10x10 boards with
+connectors and channel lines sit at 0.84-0.90 while clean 15x15 boards reach
+0.99-1.00), so it drives *relative* comparison between hypotheses and only a
+deliberately loose absolute trust gate.
+
 `examples/fluo/` holds a set of real failure inputs with ground truth, kept as a
 permanent regression test. Its central contract is that the pipeline must never
 fail *silently*: localization may fail on physically hopeless inputs (wells

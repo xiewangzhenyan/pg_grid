@@ -639,6 +639,60 @@ def test_refine_survives_points_far_outside_image():
     assert np.all(np.isfinite(adjusted))
 
 
+def test_region_hypotheses_include_both_substrate_and_dot_cloud():
+    """荧光图必须同时产出基底轮廓与发光点云两个区域假设供后续仲裁。
+
+    固定优先级是错的：基底轮廓在多数图上更好，但它会被棋盘/稀疏图案
+    和不均匀基底带偏；发光点云在基底不可见时反而是唯一线索。两者必须
+    都拿出来，由下游用图像证据选。
+    """
+    import json
+
+    from pg_grid import enumerate_region_hypotheses, read_image_unicode
+
+    case = Path(__file__).resolve().parent.parent / "examples" / "fluo" / "trusted_wrong_typical_0024"
+    image = read_image_unicode(case / "input.jpg")
+
+    hypotheses = enumerate_region_hypotheses(image)
+    methods = [h.method for h in hypotheses]
+
+    assert "opencv_faint_substrate" in methods
+    assert "opencv_emitting_dots" in methods
+    # 兜底框不应混在候选里（它不是证据，是没有证据时的最后手段）。
+    assert "fallback_center" not in methods
+
+
+def test_grid_coverage_ratio_penalises_truncated_region():
+    """原图点云包围率必须能识别"区域框切掉了部分阵列"。
+
+    支撑率只看"网格点旁边有没有候选"，对被切掉的整行完全无感——那些
+    单元根本没进矫正图。包围率反过来看"原图里检测到的单元有没有被网格
+    覆盖"，因此能抓住区域框截断。
+    """
+    import cv2
+    from pg_grid import measure_grid_coverage_ratio
+
+    size = 900
+    image = np.full((size, size, 3), 6, dtype=np.uint8)
+    centers = []
+    for row in range(10):
+        for col in range(10):
+            cx, cy = 150 + col * 60, 150 + row * 60
+            cv2.rectangle(image, (cx - 9, cy - 9), (cx + 9, cy + 9), (200, 210, 200), -1)
+            centers.append((float(cx), float(cy)))
+    centers = np.asarray(centers, dtype=np.float32)
+
+    full = measure_grid_coverage_ratio(image, centers, "bright", pitch=60.0)
+    # 只覆盖下面 7 行（模拟区域框把上面 3 行切掉）。
+    truncated = measure_grid_coverage_ratio(image, centers[30:], "bright", pitch=60.0)
+
+    assert full > 0.95
+    # 判据只统计网格邻域内的候选，因此截断越深"看得见"的比例反而越小；
+    # 关键是截断必须让包围率明显下降，用于假设之间的相对比较。
+    assert truncated < 0.92
+    assert full - truncated > 0.08
+
+
 def test_detect_chip_region_rejects_tiny_bright_cluster_in_favour_of_substrate():
     """极小的亮块不得被当作目标区域，应让位给微弱基底轮廓。
 
