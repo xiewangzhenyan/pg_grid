@@ -325,6 +325,10 @@ def _multi_threshold_blobs(
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(
             mask.astype(np.uint8), connectivity=8
         )
+        # 一次 bincount 求出全部连通域的响应总和，避免对每个域做一次
+        # 全图布尔索引——阈值档数乘以连通域数会让那种写法退化成上千次
+        # 全图扫描（实测是本函数的主要开销）。
+        sums = np.bincount(labels.ravel(), weights=response.ravel().astype(np.float64), minlength=count)
         for index in range(1, count):
             x, y, w, h, area = stats[index]
             if not (min_area <= area <= max_area):
@@ -333,8 +337,7 @@ def _multi_threshold_blobs(
                 continue
             if not (aspect_range[0] <= w / max(h, 1) <= aspect_range[1]):
                 continue
-            values = response[labels == index]
-            strength = float(values.mean()) * math.sqrt(float(area))
+            strength = float(sums[index] / max(area, 1)) * math.sqrt(float(area))
             collected.append((float(centroids[index][0]), float(centroids[index][1]), strength))
 
     if not collected:
@@ -422,6 +425,33 @@ def _detect_region_from_emitting_dots(gray: np.ndarray, width: int, height: int)
     )
 
 
+def iter_region_hypotheses(image: np.ndarray):
+    """惰性产出主区域假设，按可靠性排序。
+
+    惰性很重要：亮区路径命中且证据充分时（多数常规成像），后面两个
+    检测器根本不必运行。一次性全部计算会白白付出微弱基底与发光点云
+    两次形态学检测的代价。
+    """
+
+    if image.ndim != 3:
+        raise ValueError("iter_region_hypotheses 需要 BGR 彩色图像")
+
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    seen: set[str] = set()
+
+    primary = detect_chip_region(image)
+    if primary.method != "fallback_center":
+        seen.add(primary.method)
+        yield primary
+
+    for builder in (_detect_region_from_faint_substrate, _detect_region_from_emitting_dots):
+        region = builder(gray, width, height)
+        if region is not None and region.method not in seen:
+            seen.add(region.method)
+            yield region
+
+
 def enumerate_region_hypotheses(image: np.ndarray) -> list[ChipRegion]:
     """列出全部可用的主区域假设，供调用方用图像证据仲裁。
 
@@ -437,26 +467,7 @@ def enumerate_region_hypotheses(image: np.ndarray) -> list[ChipRegion]:
     是所有假设都失败时的最后手段。
     """
 
-    if image.ndim != 3:
-        raise ValueError("enumerate_region_hypotheses 需要 BGR 彩色图像")
-
-    height, width = image.shape[:2]
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    hypotheses: list[ChipRegion] = []
-    seen: set[str] = set()
-
-    primary = detect_chip_region(image)
-    if primary.method != "fallback_center":
-        hypotheses.append(primary)
-        seen.add(primary.method)
-
-    for builder in (_detect_region_from_faint_substrate, _detect_region_from_emitting_dots):
-        region = builder(gray, width, height)
-        if region is not None and region.method not in seen:
-            hypotheses.append(region)
-            seen.add(region.method)
-    return hypotheses
+    return list(iter_region_hypotheses(image))
 
 
 def measure_grid_coverage_ratio(
@@ -465,6 +476,7 @@ def measure_grid_coverage_ratio(
     polarity: str,
     pitch: float,
     scale_side: float | None = None,
+    candidates: np.ndarray | None = None,
 ) -> float:
     """图中被检测到的单元有多大比例被网格覆盖。
 
@@ -483,10 +495,12 @@ def measure_grid_coverage_ratio(
     if points.shape[0] == 0:
         return 0.0
 
-    if polarity == "dark":
-        candidates = _detect_dark_square_candidates(image, scale_side)
-    else:
-        candidates = _detect_bright_dot_candidates(image, scale_side)
+    if candidates is None:
+        if polarity == "dark":
+            candidates = _detect_dark_square_candidates(image, scale_side)
+        else:
+            candidates = _detect_bright_dot_candidates(image, scale_side)
+    candidates = np.asarray(candidates, dtype=np.float64)
     if candidates.shape[0] == 0:
         return 0.0
 
@@ -495,19 +509,17 @@ def measure_grid_coverage_ratio(
     # 螺丝、反光与阵列无关，把它们计入会让包围率无谓地偏低。
     lo = points.min(axis=0) - 1.5 * float(pitch)
     hi = points.max(axis=0) + 1.5 * float(pitch)
-    centers = candidates[:, :2].astype(np.float64)
+    centers = candidates[:, :2]
     near = np.all((centers >= lo) & (centers <= hi), axis=1)
     if not near.any():
         return 0.0
     centers = centers[near]
 
+    # 向量化最近邻：候选数与网格点数都是几百量级，一次广播即可，
+    # 比逐候选的 Python 循环快一到两个数量级。
     tolerance = max(3.0, float(pitch) * 0.35)
-    covered = 0
-    for cx, cy in centers:
-        distances = np.linalg.norm(points - (cx, cy), axis=1)
-        if float(distances.min()) <= tolerance:
-            covered += 1
-    return covered / float(centers.shape[0])
+    nearest = np.sqrt(((centers[:, None, :] - points[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+    return float((nearest <= tolerance).mean())
 
 
 def _fallback_center_region(width: int, height: int) -> ChipRegion:
@@ -674,6 +686,10 @@ def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | No
     edge_guard_x = width * 0.035
     edge_guard_y = height * 0.035
 
+    # 同 _multi_threshold_blobs：用 bincount 一次求出各连通域响应总和。
+    component_sums = np.bincount(
+        labels.ravel(), weights=blackhat.ravel().astype(np.float64), minlength=component_count
+    )
     candidates: list[tuple[float, float, float]] = []
     for index in range(1, component_count):
         x, y, w, h, area = stats[index]
@@ -690,8 +706,7 @@ def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | No
         if not (edge_guard_x <= cx <= width - edge_guard_x and edge_guard_y <= cy <= height - edge_guard_y):
             continue
 
-        component_values = blackhat[labels == index]
-        response = float(component_values.mean()) * math.sqrt(float(area))
+        response = float(component_sums[index] / max(area, 1)) * math.sqrt(float(area))
         candidates.append((float(cx), float(cy), response))
 
     if not candidates:
@@ -844,6 +859,26 @@ def _cluster_axis_candidates(values: np.ndarray, weights: np.ndarray, length: in
     return clusters
 
 
+def _fit_line_slope_intercept(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """一次多项式（直线）的闭式最小二乘解，等价于 np.polyfit(x, y, deg=1)。
+
+    轴选择会枚举成千上万个组合，每个组合都要拟合一次直线；np.polyfit
+    内部走 Vandermonde 矩阵加通用 lstsq，开销远高于此处需要的两参数解
+    （实测该路径上 polyfit 被调用 3 万次、占单图耗时约四分之一）。
+    """
+
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    x_mean = x.mean()
+    y_mean = y.mean()
+    dx = x - x_mean
+    denominator = float((dx * dx).sum())
+    if denominator <= 1e-12:
+        return 0.0, float(y_mean)
+    slope = float((dx * (y - y_mean)).sum() / denominator)
+    return slope, float(y_mean - slope * x_mean)
+
+
 def _complete_axis_with_missing_clusters(
     clusters: list[tuple[float, float, int]],
     count: int,
@@ -889,7 +924,7 @@ def _complete_axis_with_missing_clusters(
 
     for shift in range(count - span):
         assigned = indices + shift
-        pitch, start = np.polyfit(assigned.astype(np.float64), centers, deg=1)
+        pitch, start = _fit_line_slope_intercept(assigned.astype(np.float64), centers)
         if not min_pitch <= pitch <= max_pitch:
             continue
         fitted = start + pitch * index_axis
@@ -951,7 +986,7 @@ def _select_regular_axis_from_clusters(
         supports = np.asarray([item[1] for item in combo], dtype=np.float32)
         counts = np.asarray([item[2] for item in combo], dtype=np.float32)
 
-        pitch, start = np.polyfit(index_axis, centers, deg=1)
+        pitch, start = _fit_line_slope_intercept(index_axis, centers)
         if not (min_pitch <= pitch <= max_pitch):
             continue
 
@@ -2005,6 +2040,97 @@ def _default_rectified_size(grid_size: int) -> int:
     return int(max(720, min(1600, grid_size * 80)))
 
 
+# 仲裁保护参数。
+# REGION_WIN_MARGIN：换掉首选假设所需的最小分差。仲裁分是几项带噪证据
+#   的加权和，零点几个百分点的领先不足以支持切换（实测有案例在
+#   0.428 vs 0.503 下切换后误差从 118% 恶化到 669%）。
+# REGION_MIN_EVIDENCE：最优分低于此值说明没有任何假设拿到足够证据
+#   ——通常是候选检测在该图上整体失效，让覆盖率与支撑率同时归零。
+#   "证据缺失"不等于"证据为负"，此时切换是赌博，保留按可靠性排序的首选。
+REGION_WIN_MARGIN = 0.08
+REGION_MIN_EVIDENCE = 0.55
+# 计算包围率时原图检测的最长边上限。覆盖率只需分辨到 0.35 个间距，
+# 在 4000px 级原图上全分辨率检测纯属浪费。
+COVERAGE_DETECT_MAX_SIDE = 1600.0
+
+
+def select_region_solution(solutions: list[dict[str, object]]) -> dict[str, object]:
+    """在多个区域假设的求解结果中择优，带切换保护。
+
+    solutions 按可靠性顺序给出（首项为默认假设），每项至少包含 score。
+    """
+
+    if not solutions:
+        raise ValueError("没有可选择的区域假设")
+    first = solutions[0]
+    best = max(solutions, key=lambda item: float(item["score"]))
+    if best is first:
+        return first
+    if float(best["score"]) < REGION_MIN_EVIDENCE:
+        return first
+    if float(best["score"]) - float(first["score"]) < REGION_WIN_MARGIN:
+        return first
+    return best
+
+
+def _median_lattice_pitch(points: np.ndarray, grid_size: int) -> float:
+    """从行优先排列的点阵估计间距（相邻点距的中位数）。"""
+
+    points = np.asarray(points, dtype=np.float64)
+    if grid_size < 2 or points.shape[0] != grid_size * grid_size:
+        return 0.0
+    lattice = points.reshape(grid_size, grid_size, 2)
+    row_steps = np.linalg.norm(np.diff(lattice, axis=1), axis=2)
+    col_steps = np.linalg.norm(np.diff(lattice, axis=0), axis=2)
+    return (float(np.median(row_steps)) + float(np.median(col_steps))) / 2.0
+
+
+def _cached_original_candidates(
+    original: np.ndarray,
+    polarity: str,
+    region: ChipRegion,
+    rectified_size: int,
+    cache: dict[str, np.ndarray],
+) -> np.ndarray:
+    """在原图坐标系检测单元候选，跨区域假设复用。
+
+    检测器的几何门限是相对"标准矫正图边长"定义的，而原图里单元要小得多
+    （实拍图 4000px 幅面上单元只有约 20px），直接套用会把真实单元全部
+    过滤掉。因此用区域框在原图中的跨度作为尺度参考——它正是矫正图
+    边长对应的原图长度。各假设的跨度接近，门限区间又有数倍余量，
+    所以一次检测即可复用。
+    """
+
+    key = str(polarity)
+    if key in cache:
+        return cache[key]
+
+    # 覆盖率的判定容差是 0.35 个间距，用不着全分辨率：手机原图动辄
+    # 4000px 幅面，直接在上面做形态学检测会成为单图耗时的大头。
+    # 先降采样再检测，最后把坐标缩放回原图尺度。
+    height, width = original.shape[:2]
+    scale = min(1.0, COVERAGE_DETECT_MAX_SIDE / float(max(height, width)))
+    if scale < 1.0:
+        small = cv2.resize(original, (max(1, int(width * scale)), max(1, int(height * scale))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = original
+
+    xs, ys = region.points[:, 0], region.points[:, 1]
+    span = max(float(xs.max() - xs.min()), float(ys.max() - ys.min()), 1.0) * scale
+    if polarity == "dark":
+        candidates = _detect_dark_square_candidates(small, span)
+    else:
+        candidates = _detect_bright_dot_candidates(small, span)
+
+    candidates = np.asarray(candidates, dtype=np.float64)
+    if candidates.shape[0] and scale < 1.0:
+        candidates = candidates.copy()
+        candidates[:, :2] /= scale
+    cache[key] = candidates
+    return candidates
+
+
 def _solve_with_region(
     original: np.ndarray,
     region: ChipRegion,
@@ -2012,6 +2138,7 @@ def _solve_with_region(
     rectified_size: int,
     config: PipelineConfig,
     pitch: float,
+    coverage_cache: dict[str, np.ndarray],
 ) -> dict[str, object]:
     """在给定主区域假设下走完整条几何链路，并给出可比较的证据分。
 
@@ -2028,24 +2155,18 @@ def _solve_with_region(
         rectified, points, grid_size, radius=max(4, int(pitch * 0.32)), polarity=polarity
     )
 
-    # 包围率在"扩展矫正图"里测量：沿用同一单应，但输出画布放大，
-    # 使区域框之外的一圈也进入视野。若区域框截断了阵列，被切掉的单元
-    # 会出现在这圈里且没有网格点覆盖，包围率随之下降。
-    # 单元的像素尺寸不随画布变化，因此几何门限要用原矫正图尺度
-    # （scale_side），否则真实单元会被放大后的门限全部过滤掉。
-    expand = 1.4
-    expanded_size = int(round(rectified_size * expand))
-    offset = (expanded_size - rectified_size) / 2.0
-    dst = np.array(
-        [[offset, offset], [offset + rectified_size - 1, offset],
-         [offset + rectified_size - 1, offset + rectified_size - 1], [offset, offset + rectified_size - 1]],
-        dtype=np.float32,
-    )
-    expanded_matrix = cv2.getPerspectiveTransform(region.points.astype(np.float32), dst)
-    expanded = cv2.warpPerspective(original, expanded_matrix, (expanded_size, expanded_size), flags=cv2.INTER_LINEAR)
+    # 包围率必须在比区域框更大的视野里测量，否则看不到被框切掉的单元。
+    # 做法是在**原图**里检测一次单元，再把网格点反投影到原图坐标系比较，
+    # 而不是为每个假设生成一张放大的矫正图——后者要多付 1.96 倍面积的
+    # 透视变换加一次重复检测，是上一版开销的主要来源。
+    # 检测结果由 coverage_cache 跨假设复用（各假设的尺度相近）。
+    projected = cv2.perspectiveTransform(
+        refined.reshape(-1, 1, 2).astype(np.float32), inverse_matrix
+    ).reshape(-1, 2).astype(np.float64)
+    original_pitch = _median_lattice_pitch(projected, grid_size)
+    candidates = _cached_original_candidates(original, polarity, region, rectified_size, coverage_cache)
     coverage = measure_grid_coverage_ratio(
-        expanded, refined.astype(np.float64) + offset, polarity,
-        max(float(lattice_info.get("pitch_px", pitch)), 1.0), scale_side=rectified_size,
+        original, projected, polarity, max(original_pitch, 1.0), candidates=candidates,
     )
 
     support = lattice_info.get("candidate_support_ratio")
@@ -2089,16 +2210,26 @@ def process_image(
     # 因此不按固定优先级取一条，而是让每个假设各自走完晶格拟合，
     # 再用图像证据择优——与本管线在主区域阈值、单元极性上已经采用的
     # 做法一致（都是"生成多个假设 + 用证据仲裁"，而不是预设顺序）。
-    solutions = []
-    for candidate_region in enumerate_region_hypotheses(original) or [detect_chip_region(original)]:
-        solution = _solve_with_region(original, candidate_region, grid_size, rectified_size, config, pitch)
+    solutions: list[dict[str, object]] = []
+    coverage_cache: dict[str, np.ndarray] = {}
+    for candidate_region in iter_region_hypotheses(original):
+        solution = _solve_with_region(
+            original, candidate_region, grid_size, rectified_size, config, pitch, coverage_cache
+        )
         solutions.append(solution)
-        # 短路：证据已经很强时不必再算其余假设，省去重复的矫正与拟合。
+        # 短路：证据已经很强时不再展开后续假设。区域假设是惰性产出的，
+        # 因此这里 break 会连带省下后面几个检测器的全部计算。
         if solution["coverage"] >= 0.95 and solution["lattice_info"]["candidate_support_ratio"] is not None \
                 and float(solution["lattice_info"]["candidate_support_ratio"]) >= 0.90:
             break
+    if not solutions:
+        solutions.append(
+            _solve_with_region(
+                original, detect_chip_region(original), grid_size, rectified_size, config, pitch, coverage_cache
+            )
+        )
 
-    best = max(solutions, key=lambda item: item["score"])
+    best = select_region_solution(solutions)
     region = best["region"]
     rectified = best["rectified"]
     inverse_matrix = best["inverse_matrix"]
