@@ -13,6 +13,7 @@ No application-specific background is required to use or review this repository.
 - `pg_quant_viz.py`: unit-level visualizations (intensity/SNR heatmaps, corrected-color map, reliability overlay).
 - `pg_benchmark.py`: seeded synthetic perturbation benchmark (7 perturbation families) with degradation-curve reports and A/B comparison.
 - `pg_benchmark_demo.py`: command-line benchmark runner and report comparator.
+- `pg_fluoro_sim.py`: physically-modelled fluorescence array simulator with ground truth — generates emission images (wavelength→RGB, per-well intensities, optics, sensor noise) and evaluates the pipeline against the known truth.
 - `pg_unit_export.py`: per-unit tight cropping — exports every array unit as an
   individual background-free PNG with a manifest and a contact-sheet
   verification image.
@@ -205,6 +206,45 @@ python pg_unit_export.py --image "examples/photo.jpg" --grid 15 --output crops/p
 
 On the bundled real 15x15 photo this exports 225/225 crops with zero
 fallbacks; crops are lossless PNGs suitable for downstream per-unit analysis.
+
+## Fluorescence Simulation with Ground Truth
+
+`pg_fluoro_sim.py` renders self-luminous (fluorescent) arrays through a
+physical imaging chain, so the detection limit it reports is meaningful rather
+than an artifact of drawing colored squares:
+
+1. **Scene radiance** (linear): per-well emission with a configurable intensity
+   pattern (log dilution series by default, spanning from below the noise floor
+   to saturation), substrate autofluorescence, filter leakage.
+2. **Excitation and optics**: illumination gradient, inter-well optical
+   crosstalk, defocus PSF, vignetting, lateral chromatic aberration.
+3. **Geometry**: rotation, perspective, radial distortion (forward-mapped for
+   ground-truth points, numerically inverted for image resampling).
+4. **Sensor**: exposure to electrons, Poisson shot noise, dark current,
+   Gaussian read noise, PRNU fixed-pattern noise, hot pixels, full-well
+   clipping, gamma, 8-bit quantization, optional JPEG compression.
+
+Emission wavelength maps to RGB via a CIE piecewise approximation — 530 nm
+gives the expected yellow-green. Ground truth (per-well centers after all
+geometric transforms, plus set intensities) is written alongside the image.
+
+```powershell
+python pg_fluoro_sim.py --grid 15 --output sim/f15 --evaluate
+python pg_fluoro_sim.py --grid 15 --output sim/scan --intensity-scan
+python pg_fluoro_sim.py --grid 15 --output sim/sweep --sweep
+```
+
+`--intensity-scan` answers the practical question directly: it steps the
+overall emission level down and reports where localization stops working. On
+the default 15×15 configuration the pipeline is reliable down to a peak of
+about 20 grey levels (support 0.71, localization 1.98 %pitch, rank fidelity
+0.989) and fails cleanly below roughly 10 grey levels — flagging
+`trusted=false` rather than returning a wrong grid.
+
+Note that self-luminous arrays have no continuous bright panel; the region
+detector handles this with a dedicated emitting-dot-cloud path (outliers
+rejected by nearest-neighbour distance, since hot pixels are isolated while
+array points sit one pitch apart).
 
 ## Perturbation Benchmark and A/B Comparison
 

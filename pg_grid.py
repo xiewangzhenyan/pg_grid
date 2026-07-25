@@ -188,6 +188,12 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
             candidates.append((score, contour, method))
 
     if not candidates:
+        # 没有连续亮区：荧光/自发光成像下面板本身不发光，只有单元发射，
+        # 图中最大的连续亮区就是单个发光点，面积远低于目标区域门限。
+        # 此时改由发光点云自身的分布界定主区域。
+        dot_region = _detect_region_from_emitting_dots(gray, width, height)
+        if dot_region is not None:
+            return dot_region
         return _fallback_center_region(width, height)
 
     _, best_contour, best_method = max(candidates, key=lambda item: item[0])
@@ -202,6 +208,147 @@ def detect_chip_region(image: np.ndarray) -> ChipRegion:
     expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
 
     return ChipRegion(points=order_quad_points(expanded), score=float(rect[1][0] * rect[1][1]), method=best_method)
+
+
+def _multi_threshold_blobs(
+    response: np.ndarray,
+    min_area: int,
+    max_area: int,
+    min_box: int,
+    max_box: int,
+    aspect_range: tuple[float, float] = (0.45, 1.80),
+    levels: int = 6,
+    noise_floor: float | None = None,
+) -> list[tuple[float, float, float]]:
+    """在一组几何递增的阈值上提取斑点并去重合并。
+
+    单一阈值无法处理跨数量级的亮度分布：自发光/荧光阵列里最亮与最暗
+    单元可以相差一两个数量级，全局阈值（Otsu）会牺牲弱单元，局部自适应
+    阈值又会被邻近强单元抬高统计量而同样失效。
+
+    这里改为在噪声水平到峰值之间取若干阈值各提取一次，再按中心距离
+    去重（保留响应更强者）。强单元在高阈值处被干净地分离，弱单元在低
+    阈值处被捕获；当单一阈值已经足够时，各档结果重合，去重后与原来一致。
+
+    返回 [(cx, cy, response)]。
+    """
+
+    finite = response[np.isfinite(response)]
+    if finite.size == 0:
+        return []
+    if noise_floor is not None:
+        base = float(noise_floor)
+    else:
+        median = float(np.median(finite))
+        mad = float(np.median(np.abs(finite - median)))
+        base = median + 3.0 * max(1.0, 1.4826 * mad)
+    peak = float(np.percentile(finite, 99.9))
+    if peak <= base:
+        thresholds = [base]
+    else:
+        thresholds = list(np.geomspace(base, peak, max(2, levels)))
+
+    collected: list[tuple[float, float, float]] = []
+    for threshold in thresholds:
+        _, mask = cv2.threshold(response, float(threshold), 255, cv2.THRESH_BINARY)
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), connectivity=8
+        )
+        for index in range(1, count):
+            x, y, w, h, area = stats[index]
+            if not (min_area <= area <= max_area):
+                continue
+            if not (min_box <= w <= max_box and min_box <= h <= max_box):
+                continue
+            if not (aspect_range[0] <= w / max(h, 1) <= aspect_range[1]):
+                continue
+            values = response[labels == index]
+            strength = float(values.mean()) * math.sqrt(float(area))
+            collected.append((float(centroids[index][0]), float(centroids[index][1]), strength))
+
+    if not collected:
+        return []
+
+    # 去重：同一单元会在多个阈值档各出现一次，保留响应最强的那次。
+    collected.sort(key=lambda item: item[2], reverse=True)
+    merged: list[tuple[float, float, float]] = []
+    for cx, cy, strength in collected:
+        if all(math.hypot(cx - mx, cy - my) > min_box for mx, my, _ in merged):
+            merged.append((cx, cy, strength))
+    return merged
+
+
+def _detect_region_from_emitting_dots(gray: np.ndarray, width: int, height: int) -> ChipRegion | None:
+    """由离散发光点云界定主区域（荧光/自发光成像路径）。
+
+    适用场景：暗背景 + 一片规则排布的发光单元，没有连续亮面板可供
+    阈值分割。此时目标区域的物理定义就是"发光单元的分布范围"。
+
+    做法：顶帽增强小亮斑 -> 几何过滤取点云 -> 用点云的最小外接矩形
+    作为主区域。为避免把孤立反光/热像素也算进去，要求点数足够多，
+    且用中位数绝对偏差剔除远离主簇的离群点。
+    """
+
+    side = min(width, height)
+    kernel_size = max(15, int(side * 0.030)) | 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    if int(tophat.max()) < 8:
+        return None
+
+    # 多阈值提取：荧光阵列内部亮度可跨一两个数量级，单一阈值会漏掉弱单元，
+    # 导致点云只覆盖亮的那部分、外接框严重偏小。
+    blobs = _multi_threshold_blobs(
+        tophat,
+        min_area=max(4, int(side * side * 2e-6)),
+        max_area=max(5, int(side * side * 0.004)),
+        min_box=max(3, int(side * 0.003)),
+        max_box=max(12, int(side * 0.06)),
+        aspect_range=(0.3, 3.3),
+    )
+    points = [(cx, cy) for cx, cy, _ in blobs]
+
+    # 阵列至少 10x10，允许大量漏检，但太少就不足以界定区域。
+    if len(points) < 24:
+        return None
+
+    cloud = np.asarray(points, dtype=np.float64)
+    # 剔除离群点（热像素、孤立反光、图像边缘杂散）。
+    # 判据是"最近邻距离"而不是"到中心的距离"或单轴 IQR：阵列内的点
+    # 彼此相距一个间距，而热像素/杂散点是孤立的，最近邻距离远大于间距。
+    # 这利用了"阵列"这一结构先验，对少量极端离群点也灵敏——散布型判据
+    # 会被多数真实点主导而失效（少数几个热像素足以把外接框撑大数百像素）。
+    difference = cloud[:, None, :] - cloud[None, :, :]
+    distances = np.sqrt((difference ** 2).sum(axis=2))
+    np.fill_diagonal(distances, np.inf)
+    nearest = distances.min(axis=1)
+    pitch_estimate = float(np.median(nearest))
+    keep = nearest <= max(3.0, pitch_estimate * 2.5)
+    if int(keep.sum()) < 24:
+        return None
+    cloud = cloud[keep].astype(np.float32)
+
+    rect = cv2.minAreaRect(cloud)
+    rect_area = float(rect[1][0] * rect[1][1])
+    if rect_area < width * height * 0.002 or rect_area > width * height * 0.92:
+        return None
+    aspect = rect[1][0] / max(rect[1][1], 1e-6)
+    if not 0.35 <= aspect <= 2.8:
+        return None
+
+    ordered = order_quad_points(cv2.boxPoints(rect))
+    # 点云外接框贴着最外圈单元的中心（而不是面板边界），必须外扩出余量，
+    # 否则矫正后最外圈单元贴边，会被后续轴选择的位置约束判为不合法。
+    # 取 1.205 使阵列中心范围落在矫正图的 8.5%-91.5%，与亮面板路径
+    # （面板自带约 8.5% 边距 + 1.10 外扩）后的版面一致。
+    expansion = 1.205
+    box_center = ordered.mean(axis=0)
+    expanded = box_center + (ordered - box_center) * expansion
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
+    return ChipRegion(
+        points=order_quad_points(expanded), score=rect_area, method="opencv_emitting_dots"
+    )
 
 
 def _fallback_center_region(width: int, height: int) -> ChipRegion:
@@ -412,40 +559,37 @@ def _detect_bright_dot_candidates(rectified: np.ndarray) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
     tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
 
-    # Otsu 阈值只从内部区域估计：面板边缘的阶跃过渡在顶帽图中形成
-    # 远强于亮点的窄亮带，若参与全图 Otsu 统计，阈值会被抬到亮点响应
-    # 之上而导致全部漏检。阈值仍应用于全图，边缘行列的亮点照常分割。
+    # 多阈值提取：自发光/荧光阵列内部亮度可跨一两个数量级，单一全局阈值
+    # （Otsu）会牺牲弱单元，局部自适应阈值又被邻近强单元抬高而同样失效。
+    # 噪声基准只从内部区域估计：面板边缘的阶跃过渡在顶帽图中形成远强于
+    # 亮点的窄亮带，若参与全图统计会把阈值抬到亮点响应之上导致全部漏检。
     interior = tophat[int(height * 0.10):int(height * 0.90), int(width * 0.10):int(width * 0.90)]
-    otsu_value, _ = cv2.threshold(interior, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, mask = cv2.threshold(tophat, float(otsu_value), 255, cv2.THRESH_BINARY)
-    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if interior.size == 0:
+        interior = tophat
 
     # 亮点直径一般在矫正图边长的 0.8%-4.5% 之间；过大者多为高光带/边缘光晕。
     min_box = max(5, int(side * 0.006))
     max_box = max(16, int(side * 0.045))
     min_area = max(20, int(side * side * 0.00004))
     max_area = max(240, int(side * side * 0.00110))
+
+    median = float(np.median(interior))
+    mad = float(np.median(np.abs(interior - median)))
+    noise_floor = median + 3.0 * max(1.0, 1.4826 * mad)
+    blobs = _multi_threshold_blobs(
+        tophat,
+        min_area=min_area, max_area=max_area,
+        min_box=min_box, max_box=max_box,
+        noise_floor=noise_floor,
+    )
+
     edge_guard_x = width * 0.035
     edge_guard_y = height * 0.035
-
-    candidates: list[tuple[float, float, float]] = []
-    for index in range(1, component_count):
-        x, y, w, h, area = stats[index]
-        aspect = w / max(h, 1)
-        cx, cy = centroids[index]
-
-        if not (min_area <= area <= max_area):
-            continue
-        if not (min_box <= w <= max_box and min_box <= h <= max_box):
-            continue
-        if not (0.45 <= aspect <= 1.80):
-            continue
-        if not (edge_guard_x <= cx <= width - edge_guard_x and edge_guard_y <= cy <= height - edge_guard_y):
-            continue
-
-        component_values = tophat[labels == index]
-        response = float(component_values.mean()) * math.sqrt(float(area))
-        candidates.append((float(cx), float(cy), response))
+    candidates = [
+        (cx, cy, strength)
+        for cx, cy, strength in blobs
+        if edge_guard_x <= cx <= width - edge_guard_x and edge_guard_y <= cy <= height - edge_guard_y
+    ]
 
     if not candidates:
         return np.empty((0, 3), dtype=np.float32)
@@ -735,10 +879,15 @@ def _refine_one_10x10_dark_square_center(
     """
 
     height, width = gray.shape[:2]
-    x0 = max(0, int(round(x)) - radius)
-    x1 = min(width, int(round(x)) + radius + 1)
-    y0 = max(0, int(round(y)) - radius)
-    y1 = min(height, int(round(y)) + radius + 1)
+    xi, yi = int(round(x)), int(round(y))
+    # 与 _refine_grid_points_with_status 同理：图外点直接判无证据，
+    # 负索引会绕过空窗口检查（见该函数注释）。
+    if not (0 <= xi < width and 0 <= yi < height):
+        return None
+    x0 = max(0, xi - radius)
+    x1 = min(width, xi + radius + 1)
+    y0 = max(0, yi - radius)
+    y1 = min(height, yi + radius + 1)
     window = gray[y0:y1, x0:x1]
     if window.size == 0:
         return None
@@ -888,6 +1037,42 @@ def _order_polarities_by_evidence(
     return sorted(("dark", "bright"), key=lambda p: (gaps[p], p != hint))
 
 
+def _measure_grid_polarity_contrast(gray: np.ndarray, points: np.ndarray, grid_size: int) -> float:
+    """测量候选网格的"点位 vs 间隙"对比度。
+
+    正值表示网格点比相邻点位的中点更亮（亮单元），负值表示更暗（暗单元）。
+
+    这是极性歧义的最终仲裁依据：暗单元阵列的亮间隙本身也构成规则晶格
+    （互补晶格），投影峰同样整齐，仅凭规则性无法区分；但两者的点位落处
+    对比度符号恰好相反。相比候选数量或全局灰度统计，本判据直接读取图像
+    在候选网格位置上的证据，因此在候选检测退化（重模糊）时仍然可用。
+    """
+
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if grid_size < 2 or points.shape[0] != grid_size * grid_size:
+        return 0.0
+    height, width = gray.shape[:2]
+    lattice = points.reshape(grid_size, grid_size, 2)
+    # 间隙取相邻点位的中点（水平与垂直两个方向）。
+    gaps = np.concatenate(
+        [
+            ((lattice[:, :-1] + lattice[:, 1:]) / 2.0).reshape(-1, 2),
+            ((lattice[:-1, :] + lattice[1:, :]) / 2.0).reshape(-1, 2),
+        ],
+        axis=0,
+    )
+
+    def _sample(sample_points: np.ndarray) -> float:
+        xs = np.rint(sample_points[:, 0]).astype(int)
+        ys = np.rint(sample_points[:, 1]).astype(int)
+        inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        if not inside.any():
+            return 0.0
+        return float(np.median(gray[ys[inside], xs[inside]]))
+
+    return _sample(points) - _sample(gaps)
+
+
 def _fit_grid_points_with_polarity(
     rectified: np.ndarray,
     grid_size: int,
@@ -932,12 +1117,33 @@ def _fit_grid_points_with_polarity(
         if lattice is not None:
             return lattice, polarity
 
-    preferred = order[0]
-    projected = _fit_axis_projection(gray, preferred, grid_size, margin_ratio)
-    if projected is not None:
-        return projected, preferred
+    # 投影回退：两个极性各拟合一次，用"点位 vs 间隙"对比度直接仲裁。
+    # 不能只信排序——候选拟合都失败时说明候选证据本身不可靠（重模糊下
+    # 两极候选数都远离理论值），此时排序依据已失去意义；而对比度是在
+    # 候选网格位置上读取的图像证据，恰好能区分真实晶格与互补晶格。
+    best: tuple[float, np.ndarray, str] | None = None
+    for polarity in order:
+        projected = _fit_axis_projection(gray, polarity, grid_size, margin_ratio)
+        if projected is None:
+            continue
+        contrast = _measure_grid_polarity_contrast(gray, projected, grid_size)
+        # 对比度符号与该极性一致时才算作正向证据。
+        evidence = contrast if polarity == "bright" else -contrast
+        if best is None or evidence > best[0]:
+            best = (evidence, projected, polarity)
 
-    return generate_grid_points(grid_size, width, height, margin_ratio=margin_ratio), preferred
+    if best is not None and best[0] > 0.0:
+        return best[1], best[2]
+    if best is not None:
+        # 两个极性都没有正向对比度证据：保留排序首选的结果，
+        # 后续的候选支撑率检查会把这种低置信情况标记出来。
+        preferred = order[0]
+        projected = _fit_axis_projection(gray, preferred, grid_size, margin_ratio)
+        if projected is not None:
+            return projected, preferred
+        return best[1], best[2]
+
+    return generate_grid_points(grid_size, width, height, margin_ratio=margin_ratio), order[0]
 
 
 def fit_grid_points(rectified: np.ndarray, grid_size: int, margin_ratio: float = 0.085) -> np.ndarray:
@@ -985,10 +1191,16 @@ def _refine_grid_points_with_status(
                 status[idx] = True
                 continue
 
-        x0 = max(0, int(round(x)) - radius)
-        x1 = min(width, int(round(x)) + radius + 1)
-        y0 = max(0, int(round(y)) - radius)
-        y1 = min(height, int(round(y)) + radius + 1)
+        xi, yi = int(round(x)), int(round(y))
+        # 点落在图像外就是"没有图像证据"，直接跳过。
+        # 必须显式判断而不能只靠空窗口检查：xi 为负时 min(width, xi+radius+1)
+        # 会得到负数，numpy 把它当成从末尾计数的索引，切片反而非空。
+        if not (0 <= xi < width and 0 <= yi < height):
+            continue
+        x0 = max(0, xi - radius)
+        x1 = min(width, xi + radius + 1)
+        y0 = max(0, yi - radius)
+        y1 = min(height, yi + radius + 1)
         window = gray[y0:y1, x0:x1].astype(np.float32)
         if window.size == 0:
             continue
