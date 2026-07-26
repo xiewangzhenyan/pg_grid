@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 def test_transmittance_is_monotonic_and_blank_is_unity():
@@ -79,7 +80,7 @@ def test_render_produces_bright_wells_on_dark_mask(tmp_path):
     """黑罩挡光、孔透光：孔内必须显著亮于罩体，极性为 bright。"""
     from pg_colori_sim import ColorimetricConfig, render_colorimetric_scene
 
-    config = ColorimetricConfig(grid_size=15, image_size=600, seed=3)
+    config = ColorimetricConfig(grid_size=15, image_size=600, seed=3, layout="mask")
     image, truth = render_colorimetric_scene(config)
 
     assert image.shape == (600, 600, 3)
@@ -94,6 +95,30 @@ def test_render_produces_bright_wells_on_dark_mask(tmp_path):
     well = [gray[int(y), int(x)] for x, y in points
             if 0 <= int(y) < 600 and 0 <= int(x) < 600]
     assert float(np.median(well)) > float(np.median(gray)) * 1.5
+
+
+def test_substrate_layout_makes_spots_darker_than_substrate():
+    """亮基底形态：反应区必须比基底**暗**，极性为 dark。
+
+    这是实拍 15x15 芯片的真实样子（白色膜基底 + 深色反应点）。它与黑罩
+    形态走的是定位管线里完全不同的检测器（暗方块 vs 亮点），所以两种
+    形态都必须能生成，否则验证的是另一条代码路径。
+    """
+    from pg_colori_sim import ColorimetricConfig, render_colorimetric_scene
+
+    config = ColorimetricConfig(
+        grid_size=15, image_size=700, seed=4, layout="substrate",
+        concentration_pattern="uniform", concentration_max_uM=400.0,
+        blank_well_count=0, el_honeycomb=0.0, substrate_texture=0.0,
+    )
+    image, truth = render_colorimetric_scene(config)
+
+    gray = image.mean(axis=2)
+    points = np.asarray(truth["points"], dtype=np.float64)
+    spot = [gray[int(y), int(x)] for x, y in points
+            if 0 <= int(y) < 700 and 0 <= int(x) < 700]
+    panel = float(np.percentile(gray[gray > 30], 75))    # 基底亮度
+    assert float(np.median(spot)) < panel * 0.9, "反应区没有比基底暗"
 
 
 def test_blank_image_is_brighter_than_sample(tmp_path):
@@ -125,14 +150,17 @@ def test_write_sample_emits_paired_blank(tmp_path):
         assert json.load(f)["mode"] == "blank"
 
 
-def test_pipeline_localizes_colorimetric_image(tmp_path):
-    """定位管线必须能处理比色图（黑罩亮孔阵列）。"""
+@pytest.mark.parametrize("layout,expected_polarity",
+                         [("substrate", "dark"), ("mask", "bright")])
+def test_pipeline_localizes_colorimetric_image(tmp_path, layout, expected_polarity):
+    """定位管线必须能处理**两种**比色版面，且极性判定正确。"""
     import cv2
     from pg_colori_sim import ColorimetricConfig, write_colorimetric_sample
     from pg_grid import process_image
 
     config = ColorimetricConfig(
-        grid_size=15, image_size=1100, seed=2,
+        grid_size=15, image_size=1100, seed=2, layout=layout,
+        concentration_pattern="uniform", concentration_max_uM=400.0, blank_well_count=0,
         rotation_deg=1.5, perspective_strength=0.01, radial_k1=-0.02,
     )
     paths = write_colorimetric_sample(config, tmp_path, name="loc")
@@ -141,7 +169,7 @@ def test_pipeline_localizes_colorimetric_image(tmp_path):
 
     result = process_image(image_path=paths["image"], grid_size=15, output_dir=tmp_path / "out")
 
-    assert result["unit_polarity"] == "bright"
+    assert result["unit_polarity"] == expected_polarity
     assert result["point_count"] == 225
 
     region = np.asarray(result["chip_region"]["points"], dtype=np.float32)

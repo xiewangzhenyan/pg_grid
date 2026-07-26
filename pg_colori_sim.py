@@ -3,13 +3,15 @@
 对应硬件（多模态传感器 v4.2 比色模式）：
 
     D1 22×22 mm 白色 EL 面板 → 0.3 mm PET 漫射膜
-    → D2 空 → D3 黑罩(15×15 × 0.5 mm 方孔，中心距 1.0 mm) + 芯片(0.5 mm 液层)
-    → D4 空 → 短塔 → 手机主摄
+    → D2 空 → D3 芯片 + 黑罩(中心距 1.0 mm) → D4 空 → 短塔 → 手机主摄
 
-与 pg_fluoro_sim 的根本差异只有一处：**辐射来源**。
-荧光是自发光（暗场亮点，浓度越高越亮）；比色是背光透射（黑罩挡光、
-孔透光，浓度越高越**暗**）。几何上同样是"亮点阵列"，因此定位管线的
-polarity 仍然是 bright；但物理量是透射率而不是发射强度，方向相反。
+与 pg_fluoro_sim 的根本差异只有一处：**辐射来源**。荧光是自发光；
+比色是背光透射，浓度越高越**暗**——方向与荧光相反。
+
+版面形态有两种，见 ColorimetricConfig.layout。实拍芯片是"亮的散射基底
++ 深色反应点"（polarity=dark），而 v4.2 文档描述的是"黑罩 + 225 个透光
+方孔"（polarity=bright）。两者对定位管线是**不同的检测器通路**，因此
+两种都要能生成；默认取实拍那一种。
 
 成像链（几何 → 光学 → 传感器）与荧光完全共用 pg_fluoro_sim 的实现，
 不另写一份，避免两种模式的噪声/满阱/量化口径各自漂移。
@@ -96,6 +98,30 @@ class Chromophore:
         return self.epsilon_spectrum()[None, :] * molar[:, None] * path_cm
 
 
+# 常用显色产物预设。颜色由**吸收峰**决定，看到什么颜色就是它没吸掉的那部分：
+# 450 nm 吸蓝 → 呈黄；652 nm 吸红 → 呈蓝青。
+CHROMOPHORES: dict[str, Chromophore] = {
+    # TMB 酸终止后的黄色二亚胺，ELISA 最常见终点，读 450 nm。
+    "tmb-yellow": Chromophore(
+        name="TMB-acid (yellow diimine)", peak_nm=450.0, fwhm_nm=100.0, epsilon_peak=5.9e4
+    ),
+    # TMB 未终止的蓝色电荷转移复合物，读 652 nm。实拍芯片上呈青/蓝绿的
+    # 反应点对应的就是这一种——吸红透蓝绿。
+    "tmb-blue": Chromophore(
+        name="TMB (blue radical)", peak_nm=652.0, fwhm_nm=110.0, epsilon_peak=3.9e4
+    ),
+    # ABTS 绿色阳离子自由基，读 420 nm（另有 650/734 肩峰）。
+    "abts-green": Chromophore(
+        name="ABTS radical cation", peak_nm=420.0, fwhm_nm=90.0, epsilon_peak=3.6e4,
+        second_peak_nm=650.0, second_fwhm_nm=120.0, second_amplitude=0.45,
+    ),
+    # 金纳米颗粒比色（聚集变色），读 520 nm 呈红。
+    "aunp-red": Chromophore(
+        name="AuNP (520 nm plasmon)", peak_nm=520.0, fwhm_nm=80.0, epsilon_peak=2.7e8
+    ),
+}
+
+
 def el_source_spectrum(blue_peak_nm: float = 490.0, blue_fwhm_nm: float = 70.0,
                        amber_peak_nm: float = 590.0, amber_fwhm_nm: float = 90.0,
                        amber_ratio: float = 0.75) -> np.ndarray:
@@ -169,13 +195,25 @@ class ColorimetricConfig:
     **空白孔最亮**，因此曝光应让空白落在略低于满阱处（blank_level）。
     """
 
-    # --- 阵列几何（v4.2：15×15，0.5 mm 方孔，中心距 1.0 mm）---
+    # --- 阵列几何（v4.2：15×15，中心距 1.0 mm）---
     grid_size: int = 15
     image_size: int = 1600
-    panel_fill: float = 0.62          # 黑罩边长 / 图像边长
-    well_fill: float = 0.50           # 0.5 mm 孔 / 1.0 mm 中心距，硬件固定值
-    well_shape: str = "square"        # 黑罩是激光切的方孔
+    panel_fill: float = 0.62          # 面板边长 / 图像边长
+    well_fill: float = 0.40           # 反应区边长 / 中心距
+    well_shape: str = "square"        # 方形反应区
     supersample: int = 2
+
+    # 版面形态。两者的 Beer-Lambert 物理完全相同，差别只在**光从哪里透过**：
+    #
+    # - "substrate"（默认）：亮的散射基底整片透光，反应区因显色而**变暗**。
+    #   这是实拍 15×15 芯片的真实样子——白色膜基底上一格格深色反应点，
+    #   定位管线判定为 polarity=dark。
+    # - "mask"：黑色 PMMA 罩挡光、225 个方孔透光，孔即反应区，
+    #   polarity=bright。这是 v4.2 文档描述的形态。
+    #
+    # 两者对定位算法是**完全不同的通路**（暗方块检测器 vs 亮点检测器），
+    # 所以仿真必须能生成实际会拍到的那一种，否则验证的是另一条代码路径。
+    layout: str = "substrate"         # substrate | mask
 
     # --- 显色化学 ---
     concentration_pattern: str = "log_series"  # log_series | plate_series | gradient | uniform | random | checker
@@ -192,9 +230,11 @@ class ColorimetricConfig:
     # --- 曝光 ---
     blank_level: float = 0.85         # 空白孔的满阱分数；留 15% 余量防饱和
 
-    # --- 背照与黑罩 ---
+    # --- 背照、基底与黑罩 ---
     mask_leak: float = 0.0025         # 黑罩非理想遮光（PMMA 边缘散射 + 杂散光）
     outside_panel_level: float = 0.001
+    substrate_transmittance: float = 0.92   # 白色散射膜本体透射率（substrate 形态）
+    substrate_texture: float = 0.03         # 膜的纤维纹理起伏（实拍可见）
     el_honeycomb: float = 0.05        # EL 蜂窝纹残留幅度（漫射膜抑制后）
     el_honeycomb_mm: float = 1.6      # 蜂窝周期，mm
     panel_side_mm: float = 20.0       # 黑罩物理边长，用于把 mm 换算到像素
@@ -275,7 +315,7 @@ def _render_transmission_map(
     """
 
     grid = config.grid_size
-    # 画布外与黑罩本体：只留极小的漏光，黑罩是 1 mm 哑光黑 PMMA。
+    substrate_mode = config.layout != "mask"
     scene = np.full((canvas, canvas, 3), config.outside_panel_level, dtype=np.float64)
 
     panel_side = canvas * config.panel_fill
@@ -283,6 +323,8 @@ def _render_transmission_map(
     panel_y0 = (canvas - panel_side) / 2.0
     px0, py0 = int(round(panel_x0)), int(round(panel_y0))
     px1, py1 = int(round(panel_x0 + panel_side)), int(round(panel_y0 + panel_side))
+    # substrate 形态下面板本体是亮的（背光穿过散射膜）；mask 形态下
+    # 面板本体是黑罩，只留极小漏光。
     scene[py0:py1, px0:px1, :] = config.mask_leak
 
     # 背照场：EL 面板亮度分布，先在整幅画布上算好，再按孔采样。
@@ -307,6 +349,17 @@ def _render_transmission_map(
     pitch = usable / max(grid - 1, 1)
     half = max(1.0, pitch * config.well_fill / 2.0)
 
+    if substrate_mode:
+        # 亮基底：整片面板被背光穿透，亮度只受照明场和膜透射率调制。
+        # 反应区随后在其上做**减法**（额外吸收），因此斑点必然比基底暗。
+        scene[py0:py1, px0:px1, :] = (
+            field[py0:py1, px0:px1, None] * config.blank_level * config.substrate_transmittance
+        )
+        if config.substrate_texture > 0:
+            coarse = rng.normal(0.0, config.substrate_texture, (48, 48))
+            texture = cv2.resize(coarse, (px1 - px0, py1 - py0), interpolation=cv2.INTER_CUBIC)
+            scene[py0:py1, px0:px1, :] *= np.clip(1.0 + texture, 0.0, None)[:, :, None]
+
     centers = np.empty((grid * grid, 2), dtype=np.float64)
     for row in range(grid):
         for col in range(grid):
@@ -321,7 +374,14 @@ def _render_transmission_map(
             x1, y1 = min(x1, canvas), min(y1, canvas)
             if x1 <= x0 or y1 <= y0:
                 continue
-            # 该孔处的背照亮度（取孔内均值，保留蜂窝纹造成的孔间差异）
+            if substrate_mode:
+                # 反应区落在已经亮着的基底上：就地乘以显色透射率。
+                # 用乘法而不是赋值，基底的照明梯度和纹理才会被保留下来。
+                for ch in range(3):
+                    scene[y0:y1, x0:x1, ch] *= float(transmittance[index, ch])
+                continue
+
+            # 黑罩形态：孔内亮度 = 该处背照 × 显色透射率。
             local = float(field[y0:y1, x0:x1].mean()) * config.blank_level
             if config.well_shape == "circle":
                 patch = np.zeros((y1 - y0, x1 - x0), dtype=np.float64)
@@ -608,6 +668,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmax", type=float, default=800.0, help="最高浓度 µM")
     parser.add_argument("--blanks", type=int, default=8, help="空白孔数（浓度 0）")
     parser.add_argument("--path-mm", type=float, default=0.5, help="液层光程 mm")
+    parser.add_argument("--layout", default="substrate", choices=["substrate", "mask"],
+                        help="版面形态：substrate=亮基底暗斑点（实拍芯片），mask=黑罩亮孔")
+    parser.add_argument("--dye", default=None, choices=sorted(CHROMOPHORES),
+                        help="显色产物预设；给了它就忽略 --peak-nm/--epsilon")
     parser.add_argument("--peak-nm", type=float, default=450.0, help="显色产物吸收峰 nm")
     parser.add_argument("--epsilon", type=float, default=5.9e4, help="峰值摩尔吸光系数 M⁻¹cm⁻¹")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
@@ -640,9 +704,18 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output)
 
-    chromophore = Chromophore(
-        peak_nm=args.peak_nm, epsilon_peak=args.epsilon, path_length_mm=args.path_mm
-    )
+    if args.dye:
+        preset = CHROMOPHORES[args.dye]
+        chromophore = Chromophore(
+            name=preset.name, peak_nm=preset.peak_nm, fwhm_nm=preset.fwhm_nm,
+            epsilon_peak=preset.epsilon_peak, second_peak_nm=preset.second_peak_nm,
+            second_fwhm_nm=preset.second_fwhm_nm, second_amplitude=preset.second_amplitude,
+            path_length_mm=args.path_mm,
+        )
+    else:
+        chromophore = Chromophore(
+            peak_nm=args.peak_nm, epsilon_peak=args.epsilon, path_length_mm=args.path_mm
+        )
 
     if args.linearity:
         grid = np.array([10.0, 25.0, 50.0, 100.0, 200.0, 400.0, 700.0, 1000.0, 2000.0], dtype=np.float64)
@@ -661,6 +734,7 @@ def main() -> None:
             concentration_pattern=args.pattern,
             concentration_min_uM=args.cmin, concentration_max_uM=args.cmax,
             blank_well_count=args.blanks, chromophore=chromophore, seed=args.seed,
+            layout=args.layout,
             jpeg_quality=None if args.png else 92,
         )
         base.update(overrides)
