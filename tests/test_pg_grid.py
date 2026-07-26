@@ -1198,3 +1198,69 @@ def test_process_image_and_evaluation_end_to_end_10x10(tmp_path):
     assert (report_dir / "localization_metrics.json").exists()
     assert (report_dir / "localization_errors.csv").exists()
     assert (report_dir / "localization_error_overlay.jpg").exists()
+
+
+def test_bright_dot_gates_scale_with_grid_size_not_canvas_side():
+    """斑点几何门限必须按单元间距归一化，而不是按画幅边长。
+
+    _default_rectified_size 给 10x10 用 800、给 15x15 用 1200，两者的
+    单元间距同为 80px、单元尺寸同为约 34px。按边长归一化时 max_area
+    是 704 与 1584，同样大的单元在 10x10 被判超限——实测 100 个孔只
+    剩 19-24 个候选，且被拒的正是最亮最可靠的大斑点。
+    """
+    from pg_grid import _detect_bright_dot_candidates
+
+    def scene(size: int, grid_size: int) -> np.ndarray:
+        """按管线自身的边距约定铺满 grid_size² 个同样大小的亮点。"""
+        image = np.full((size, size, 3), 20, dtype=np.uint8)
+        margin = size * 0.085
+        pitch = (size - 2.0 * margin) / (grid_size - 1)
+        half = max(2, int(round(pitch * 0.42 / 2)))
+        for row in range(grid_size):
+            for col in range(grid_size):
+                cx = int(round(margin + col * pitch))
+                cy = int(round(margin + row * pitch))
+                image[cy - half:cy + half, cx - half:cx + half] = 210
+        return image
+
+    # 单元的像素尺寸在两种规格下几乎相同（约 30px），检出率也必须相同。
+    ratios = []
+    for size, grid_size in [(800, 10), (1200, 15)]:
+        found = _detect_bright_dot_candidates(scene(size, grid_size), grid_size=grid_size)
+        ratio = found.shape[0] / float(grid_size * grid_size)
+        ratios.append(ratio)
+        assert ratio >= 0.9, f"{grid_size}x{grid_size} 只检出 {found.shape[0]}/{grid_size**2}"
+    assert abs(ratios[0] - ratios[1]) < 0.1, f"两种规格检出率不一致: {ratios}"
+
+
+def test_axis_completion_tolerates_whole_dark_rows():
+    """整行低于检测地板时必须仍能补全轴，而不是放弃候选晶格路径。
+
+    自发光阵列的稀释序列里最暗的若干行整体不可见是常态：实测 log 稀释
+    序列 10x10 只有 6/10 行、15x15 只有 9/15 行产生轴向簇。原先固定
+    "最多缺 2 个"的上限会让这类图退到投影回退并给出整体错位的网格。
+    """
+    from pg_grid import _select_regular_axis_from_clusters
+
+    # 10 行晶格，起点 75、间距 72；只有后 6 行可见（前 4 行整体不发光）。
+    pitch, start, count = 72.0, 75.0, 10
+    visible = [(start + pitch * i, 500.0, 8) for i in range(4, count)]
+    axis = _select_regular_axis_from_clusters(visible, count, 800)
+
+    assert axis is not None, "缺 4 行时轴补全不应放弃"
+    assert axis.shape == (count,)
+    expected = start + pitch * np.arange(count)
+    assert float(np.abs(axis - expected).max()) < 3.0
+
+
+def test_axis_completion_uses_other_axis_pitch_as_prior():
+    """方阵两轴间距应相等，已确定的一轴是另一轴最强的可用先验。"""
+    from pg_grid import _select_regular_axis_from_clusters
+
+    pitch, start, count = 70.0, 110.0, 15
+    visible = [(start + pitch * i, 400.0, 10) for i in range(6, count)]
+
+    with_prior = _select_regular_axis_from_clusters(visible, count, 1200, pitch)
+    assert with_prior is not None
+    expected = start + pitch * np.arange(count)
+    assert float(np.abs(with_prior - expected).max()) < 3.0
