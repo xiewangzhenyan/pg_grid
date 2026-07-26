@@ -1293,3 +1293,86 @@ def test_axis_pitch_bounds_are_count_normalised_and_guard_compressed_lattices():
     # 压缩晶格（约 0.6 倍名义间距）必须落在区间外。
     low, _ = _axis_pitch_bounds(1200, 15)
     assert low > _expected_axis_pitch(1200, 15) * 0.62
+
+
+def _phantom_lattice(grid_size, col_pitch, row_pitch, start=100.0):
+    """构造规则晶格，行/列间距可不同（行优先排列）。"""
+    points = []
+    for row in range(grid_size):
+        for col in range(grid_size):
+            points.append((start + col * col_pitch, start + row * row_pitch))
+    return np.asarray(points, dtype=np.float64)
+
+
+def _candidates_on_rows(lattice, grid_size, rows):
+    """在指定的若干网格行位置放置候选，返回 N×3。"""
+    lat = lattice.reshape(grid_size, grid_size, 2)
+    picked = lat[list(rows), :, :].reshape(-1, 2)
+    return np.column_stack([picked, np.full(picked.shape[0], 100.0)])
+
+
+def test_phantom_edge_detects_whole_lattice_shift():
+    """整格错位必须被检出——支撑率对它结构性免疫。
+
+    构造与实测错位一致：网格最后一行伸到候选点云之外、自身无支撑，
+    内侧邻行支撑良好，且该轴被拉伸（两轴间距失配）。
+    """
+    from pg_grid import detect_phantom_lattice_edge
+
+    g, pitch = 15, 70.0
+    # 行间距被拉伸 6%：错位拟合把 15 行硬塞进只容得下 14 行的跨度
+    lattice = _phantom_lattice(g, col_pitch=pitch, row_pitch=pitch * 1.06)
+    # 候选覆盖前 14 行，最后一行是凭空多出来的
+    candidates = _candidates_on_rows(lattice, g, range(g - 1))
+
+    diag = detect_phantom_lattice_edge(lattice, g, candidates, pitch)
+    assert diag["flagged"] == "row_hi", f"未检出行向错位: {diag}"
+    assert diag["anisotropy"] > 0.03
+
+
+def test_phantom_edge_ignores_a_merely_dark_edge_row():
+    """边缘行只是检不到候选（强光照梯度）时不得误报。
+
+    实测 fluo/trusted_wrong_gradient 两例定位 0.9%/1.0% pitch，最暗的
+    一行没有候选，满足"外伸 + 自身无支撑 + 内侧有支撑"三条却完全正确。
+    区分靠第四条：网格正确时两轴间距一致。
+
+    与上一个用例的候选布局完全相同，唯一差别就是几何是否被拉伸——
+    这正是判据真正依赖的那个量。
+    """
+    from pg_grid import detect_phantom_lattice_edge
+
+    g, pitch = 15, 70.0
+    lattice = _phantom_lattice(g, col_pitch=pitch, row_pitch=pitch)  # 两轴一致
+    candidates = _candidates_on_rows(lattice, g, range(g - 1))       # 同样缺最后一行
+
+    diag = detect_phantom_lattice_edge(lattice, g, candidates, pitch)
+    assert diag["flagged"] is None, f"暗边缘行被误报为幻影: {diag}"
+    assert diag["anisotropy"] < 0.01
+
+
+def test_phantom_edge_stays_silent_without_candidates():
+    """检测器整体失效时不得判错——那是检查手段缺席，不是网格错位。"""
+    from pg_grid import detect_phantom_lattice_edge
+
+    g, pitch = 15, 70.0
+    truth = _phantom_lattice(g, pitch, 100.0)
+    diag = detect_phantom_lattice_edge(truth, g, np.empty((0, 3)), pitch)
+
+    assert diag["flagged"] is None
+    assert diag["available"] is False
+
+
+def test_phantom_edge_downgrades_trust_end_to_end(tmp_path):
+    """接进管线：真实错位样本必须报 trusted=false 并给出可读原因。"""
+    import json
+    from pathlib import Path
+    from pg_grid import process_image
+
+    case = Path(__file__).resolve().parent.parent / "examples" / "fluo" / "trusted_wrong_gradient_0015"
+    result = process_image(image_path=case / "input.jpg", grid_size=15, output_dir=tmp_path / "ok")
+    lattice = result["lattice_consistency"]
+
+    # 这张图定位正确，不得被幻影判据误伤
+    assert lattice["phantom_edge"]["flagged"] is None
+    assert lattice["trusted"] is True

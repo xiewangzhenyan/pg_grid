@@ -1773,6 +1773,137 @@ def _estimate_grid_pitch(points: np.ndarray, grid_size: int, fallback: float) ->
     return float(fallback)
 
 
+def _detect_candidates_for_polarity(
+    rectified: np.ndarray,
+    grid_size: int,
+    polarity: str | None,
+) -> np.ndarray | None:
+    """按极性选检测器提取候选。返回 None 表示该规格没有可用检测器。"""
+
+    if polarity == "dark":
+        return _detect_dark_square_candidates(rectified, grid_size=grid_size)
+    if polarity == "bright":
+        return _detect_bright_dot_candidates(rectified, grid_size=grid_size)
+    # 极性未知时沿用旧的按规格映射，保证向后兼容。
+    if grid_size == 10:
+        return _detect_dark_square_candidates(rectified, grid_size=grid_size)
+    if grid_size >= 15:
+        return _detect_bright_dot_candidates(rectified, grid_size=grid_size)
+    return None
+
+
+def detect_phantom_lattice_edge(
+    points: np.ndarray,
+    grid_size: int,
+    candidates: np.ndarray,
+    pitch: float,
+    overhang_min: float = 0.5,
+    edge_occupancy_max: float = 0.20,
+    inner_occupancy_min: float = 0.50,
+    anisotropy_min: float = 0.03,
+) -> dict[str, object]:
+    """检出"凭空多出一条边缘行/列"的整格错位。
+
+    这是**候选支撑率看不见的那种错误**。整块晶格沿行或列平移一个间距后，
+    绝大多数点仍然落在真实单元上——支撑率、包围率、观测率都是共享行上的
+    比值，几乎不动。实测荧光 15x15 hard 与比色 hard 两例，错位网格与
+    正确网格的这三个信号逐位相同，却分别错 103% 和 215% pitch。
+
+    唯一能看见它的地方在**边界**：平移会在一侧凭空造出一条本不存在的行，
+    同时把另一侧真实的一行丢掉。那条凭空的行有三个同时成立的特征：
+
+    1. 它伸到候选点云之外（overhang > 0.5 个间距）；
+    2. 它自己几乎没有候选支撑（edge_occupancy < 0.20）；
+    3. 但它内侧的邻行支撑良好（inner_occupancy > 0.50）。
+
+    第三条是必需的：整版都没有候选时（重模糊、检测器失效）前两条也会成立，
+    但那属于"检查手段缺席"而不是"网格错位"，不该据此判错。
+
+    前三条还不够。**边缘行只是碰巧很暗**时它们同样成立——强光照梯度下
+    最暗的一行检不到候选，但网格其实是对的（实测 fluo/trusted_wrong_gradient
+    两例定位 0.9%/1.0% pitch，却满足全部三条）。因此再加第四条：
+
+    4. 两轴间距失配（anisotropy > 0.03）。
+
+    依据是几何：整格错位迫使拟合把 grid_size 行硬塞进实际只容得下
+    grid_size−1 行的跨度，那一轴必然被**拉伸**；而边缘行变暗完全不改变
+    几何。实测真错位两例 0.099 / 0.068，暗行误报两例 0.001 / 0.001。
+
+    注意这一条只在前三条已成立时才施加。单独用各向异性会误伤实拍
+    10x10 板（连接器和通道线让区域框与阵列不齐，各向异性 0.08-0.11
+    却定位正确），而那些图的外伸量是负的，压根进不到这一步。
+
+    返回诊断字典；flagged 为被判定为幻影的边缘名，无则为 None。
+    """
+
+    result: dict[str, object] = {"flagged": None, "edges": [], "available": False}
+    points = np.asarray(points, dtype=np.float64)
+    candidates = np.asarray(candidates, dtype=np.float64)
+    if grid_size < 3 or points.shape[0] != grid_size * grid_size or candidates.shape[0] == 0:
+        return result
+
+    lattice = points.reshape(grid_size, grid_size, 2)
+    centers = candidates[:, :2]
+    tolerance = max(3.0, float(pitch) * 0.25)
+    result["available"] = True
+
+    # 两轴间距失配。方阵经矫正后行列间距应当相等；错位拉伸会破坏这一点。
+    row_pitch = float(np.median(np.linalg.norm(np.diff(lattice, axis=0), axis=2)))
+    col_pitch = float(np.median(np.linalg.norm(np.diff(lattice, axis=1), axis=2)))
+    anisotropy = abs(row_pitch / max(col_pitch, 1e-9) - 1.0)
+    result["anisotropy"] = round(anisotropy, 5)
+    result["row_pitch"] = round(row_pitch, 3)
+    result["col_pitch"] = round(col_pitch, 3)
+
+    def occupancy(row_points: np.ndarray) -> float:
+        distance = np.sqrt(((row_points[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
+        return float((distance.min(axis=1) <= tolerance).mean())
+
+    edges = (
+        ("row_lo", lattice[0, :, :], lattice[1, :, :]),
+        ("row_hi", lattice[-1, :, :], lattice[-2, :, :]),
+        ("col_lo", lattice[:, 0, :], lattice[:, 1, :]),
+        ("col_hi", lattice[:, -1, :], lattice[:, -2, :]),
+    )
+    worst: tuple[float, str] | None = None
+    for name, edge, inner in edges:
+        # 外法向：由内侧邻行指向边缘行。整条边取平均，个别点的精修抖动
+        # 不至于把方向带偏。
+        normal = edge.mean(axis=0) - inner.mean(axis=0)
+        norm = float(np.linalg.norm(normal))
+        if norm < 1e-6:
+            continue
+        normal = normal / norm
+
+        # 边缘行相对候选点云在该方向上伸出多远（以间距为单位）。
+        # 边缘行取中位数投影而不是最大值：个别点的精修抖动不该主导判定。
+        edge_projection = float(np.median(edge @ normal))
+        cloud_projection = float(np.max(centers @ normal))
+        overhang = (edge_projection - cloud_projection) / max(float(pitch), 1e-6)
+
+        edge_occupancy = occupancy(edge)
+        inner_occupancy = occupancy(inner)
+        entry = {
+            "edge": name,
+            "overhang": round(overhang, 4),
+            "edge_occupancy": round(edge_occupancy, 4),
+            "inner_occupancy": round(inner_occupancy, 4),
+        }
+        result["edges"].append(entry)
+
+        if (overhang > overhang_min
+                and edge_occupancy < edge_occupancy_max
+                and inner_occupancy > inner_occupancy_min
+                and anisotropy > anisotropy_min):
+            if worst is None or overhang > worst[0]:
+                worst = (overhang, name)
+
+    if worst is not None:
+        result["flagged"] = worst[1]
+        result["flagged_overhang"] = round(worst[0], 4)
+    return result
+
+
 def _candidate_support_ratio(
     rectified: np.ndarray,
     points: np.ndarray,
@@ -1789,17 +1920,8 @@ def _candidate_support_ratio(
     ——重模糊等场景下检测器整体失效，比例为 0 不代表网格错误。
     """
 
-    # 极性已知时按极性选检测器（任意网格规格都可校验）；
-    # 未知时沿用旧的按规格映射，保证向后兼容。
-    if polarity == "dark":
-        candidates = _detect_dark_square_candidates(rectified, grid_size=grid_size)
-    elif polarity == "bright":
-        candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
-    elif grid_size == 10:
-        candidates = _detect_dark_square_candidates(rectified, grid_size=grid_size)
-    elif grid_size >= 15:
-        candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
-    else:
+    candidates = _detect_candidates_for_polarity(rectified, grid_size, polarity)
+    if candidates is None:
         return None, 0
 
     if candidates.shape[0] == 0:
@@ -1943,6 +2065,17 @@ def bundle_adjust_lattice(
             )
 
     support, candidate_count = _candidate_support_ratio(rectified, final_points, grid_size, pitch, polarity)
+
+    # 幻影边缘检查：整格错位对支撑率/包围率/观测率全部免疫，只能在边界看见。
+    # 这三个信号都是共享行上的比值，平移一个间距后几乎不动；而凭空多出的
+    # 那条边缘行伸到候选点云之外、自身无支撑、内侧邻行却有支撑。
+    phantom_candidates = _detect_candidates_for_polarity(rectified, grid_size, polarity)
+    phantom = detect_phantom_lattice_edge(
+        final_points, grid_size,
+        phantom_candidates if phantom_candidates is not None else np.empty((0, 3)),
+        pitch,
+    )
+
     # 支撑率三态判定：
     # - unavailable：该规格没有候选检测器，检查不适用；
     # - inconclusive：检测器整体几乎无候选（如重模糊），而能走到这里说明
@@ -1955,10 +2088,19 @@ def bundle_adjust_lattice(
         trusted, support_check = True, "inconclusive"
     else:
         trusted, support_check = support >= 0.6, "ok"
+
+    # 幻影边缘是独立的一票否决：它抓的正是支撑率结构性看不见的那种错误，
+    # 所以不参与三态判定，直接推翻信任。
+    shift_reason = None
+    if phantom.get("flagged"):
+        trusted = False
+        shift_reason = (f"晶格疑似整体错位一个间距（{phantom['flagged']} 边缘无候选支撑，"
+                        f"外伸 {phantom.get('flagged_overhang')} 个间距，"
+                        f"两轴间距失配 {phantom.get('anisotropy')}）")
     inlier_residual = residual[inlier]
     info: dict[str, object] = {
         "applied": True,
-        "reason": "ok",
+        "reason": shift_reason or "ok",
         "model": "homography",
         "outlier_count": int((~inlier).sum()),
         "corrected_points": corrected,
@@ -1970,6 +2112,7 @@ def bundle_adjust_lattice(
         "trusted": bool(trusted),
         "observed_ratio": round(float(status2.sum()) / expected_count, 6),
         "mean_confidence": round(float(np.mean([m["confidence"] for m in point_meta])), 6),
+        "phantom_edge": phantom,
     }
     return final_points, info, point_meta
 

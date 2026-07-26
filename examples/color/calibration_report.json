@@ -1,0 +1,164 @@
+{
+  "schema": "pg-calibration-v1",
+  "ok": true,
+  "analyte_unit": "ng/mL",
+  "signal_channel": "B",
+  "localization": {
+    "sample_trusted": true,
+    "blank_trusted": true,
+    "zero_trusted": true,
+    "sample_support": 1.0,
+    "quality": "warn"
+  },
+  "curve": {
+    "a": 0.01522,
+    "d": 0.5123,
+    "c50": 10.37707,
+    "hill": 1.029
+  },
+  "blank": {
+    "mean_absorbance": 0.01522,
+    "sd_absorbance": 0.001808
+  },
+  "detection_limit": 0.184279,
+  "quantitation_limit": 0.612348,
+  "usable_range": [
+    0.5,
+    20.623132
+  ],
+  "usable_level_count": 8,
+  "levels": [
+    {
+      "nominal": 0.0,
+      "n": 15,
+      "n_valid": 10,
+      "mean_absorbance": 0.01484
+    },
+    {
+      "nominal": 0.5,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.02905,
+      "mean_recovered": 0.46718,
+      "recovery_pct": 93.44,
+      "cv_pct": 16.01
+    },
+    {
+      "nominal": 0.850627,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.03972,
+      "mean_recovered": 0.83639,
+      "recovery_pct": 98.33,
+      "cv_pct": 10.34
+    },
+    {
+      "nominal": 1.447133,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.05409,
+      "mean_recovered": 1.35825,
+      "recovery_pct": 93.86,
+      "cv_pct": 5.53
+    },
+    {
+      "nominal": 2.461941,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.08014,
+      "mean_recovered": 2.39759,
+      "recovery_pct": 97.39,
+      "cv_pct": 5.76
+    },
+    {
+      "nominal": 4.188388,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.11118,
+      "mean_recovered": 3.83252,
+      "recovery_pct": 91.5,
+      "cv_pct": 5.76
+    },
+    {
+      "nominal": 7.125513,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.16244,
+      "mean_recovered": 6.85905,
+      "recovery_pct": 96.26,
+      "cv_pct": 8.16
+    },
+    {
+      "nominal": 12.12231,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.22592,
+      "mean_recovered": 12.38434,
+      "recovery_pct": 102.16,
+      "cv_pct": 4.33
+    },
+    {
+      "nominal": 20.623132,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.2856,
+      "mean_recovered": 21.33869,
+      "recovery_pct": 103.47,
+      "cv_pct": 15.9
+    },
+    {
+      "nominal": 35.085191,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.35451,
+      "mean_recovered": 42.1568,
+      "recovery_pct": 120.16,
+      "cv_pct": 16.02
+    },
+    {
+      "nominal": 59.688832,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.39826,
+      "mean_recovered": 73.23388,
+      "recovery_pct": 122.69,
+      "cv_pct": 22.75
+    },
+    {
+      "nominal": 101.545881,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.43344,
+      "mean_recovered": 137.49181,
+      "recovery_pct": 135.4,
+      "cv_pct": 37.24
+    },
+    {
+      "nominal": 172.755365,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.46318,
+      "mean_recovered": 400.6702,
+      "recovery_pct": 231.93,
+      "cv_pct": 137.12
+    },
+    {
+      "nominal": 293.900804,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.46399,
+      "mean_recovered": 316.03971,
+      "recovery_pct": 107.53,
+      "cv_pct": 61.12
+    },
+    {
+      "nominal": 500.0,
+      "n": 15,
+      "n_valid": 15,
+      "mean_absorbance": 0.44496,
+      "mean_recovered": 381.12491,
+      "recovery_pct": 76.22,
+      "cv_pct": 83.64
+    }
+  ]
+}
