@@ -110,3 +110,61 @@ def test_log_series_includes_a_zero_point():
     assert series[0] == 0.0
     assert np.all(np.diff(series[1:]) > 0)
     assert abs(series[1] - 0.5) < 1e-9 and abs(series[-1] - 500.0) < 1e-6
+
+
+def test_reference_column_cancels_per_row_common_mode():
+    """参考列必须对消逐行的乘性共模（照明梯度、曝光、EL 漂移）。
+
+    吸光度已是对数量，故对数域相减 = 线性域相除，正是要消掉的那个共模。
+    """
+    from pg_calibration import apply_reference_column
+
+    grid = 15
+    signal = np.tile(np.linspace(0.0, 1.0, grid), (grid, 1))     # 逐列的真信号
+    drift = np.linspace(-0.30, 0.30, grid)[:, None]              # 逐行的共模偏置
+    observed = (signal + drift).reshape(-1)
+
+    corrected = apply_reference_column(observed, grid, reference_column=0).reshape(grid, grid)
+    # 每一行减去自己的参考点后，各行应当完全一致
+    assert np.allclose(corrected - corrected[0][None, :], 0.0, atol=1e-12)
+    # 参考列自身归零
+    assert np.allclose(corrected[:, 0], 0.0)
+
+
+def test_reference_column_is_forced_to_zero_analyte():
+    """指定参考列后，该列必须整列为零分析物，且不计入浓度档统计。"""
+    from pg_colori_sim import ColorimetricConfig
+    from pg_calibration import ImmunoassayResponse
+
+    grid = 15
+    assay = ImmunoassayResponse(kd=20.0, chromogen_max_uM=300.0, nonspecific_uM=8.0)
+    levels = np.linspace(1.0, 100.0, grid)
+
+    # 复现 calibration_run 内部的布板逻辑（列内同浓度 + 参考列置零）
+    analyte = np.tile(levels, grid).reshape(grid, grid)
+    analyte[:, 3] = 0.0
+    product = assay.chromogen_for(analyte.reshape(-1)).reshape(grid, grid)
+
+    assert np.all(analyte[:, 3] == 0.0)
+    # 零分析物处仍保留非特异本底——检出限正来源于此
+    assert np.all(product[:, 3] > 0.0)
+    assert abs(float(product[:, 3].mean()) - 8.0) < 1e-6
+
+
+def test_column_axis_puts_concentration_down_columns():
+    """默认 axis='column'：纵向通道送样品，故浓度按列变化。
+
+    方向不是无关紧要的约定——若浓度由横向通道灌进整行，那一行里就不
+    可能存在"只通缓冲液"的孔，参考列在物理上不成立。
+    """
+    grid = 15
+    levels = np.arange(1.0, grid + 1.0)
+
+    by_column = np.tile(levels, grid).reshape(grid, grid)
+    by_row = np.repeat(levels, grid).reshape(grid, grid)
+
+    # 列内同浓度、行内递增
+    assert np.allclose(by_column[:, 4], levels[4])
+    assert np.allclose(by_column[0, :], levels)
+    # 行式布板则相反
+    assert np.allclose(by_row[4, :], levels[4])

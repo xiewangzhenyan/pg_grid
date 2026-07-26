@@ -201,30 +201,72 @@ def _read_spot_channels(quant_csv: Path) -> np.ndarray | None:
     )
 
 
+def apply_reference_column(
+    absorbance: np.ndarray,
+    grid_size: int,
+    reference_column: int,
+) -> np.ndarray:
+    """用同帧参考列逐行归一化，返回扣除参考后的吸光度。
+
+    参考列只通缓冲液、不加抗原，因此每一行都有一个"同抗体、无分析物"的
+    对照，且与样品点**在同一帧图像里**。逐行相减即可对消照明梯度、曝光
+    波动、EL 亮度漂移、温度，以及不同抗体行之间的基线差异。
+
+    为什么必须同帧：抗原孵育要一小时，中间还要拆装和清洗。跨越这一小时
+    的时序参考（加样前拍一张、加完再拍一张）要承受 EL 预热与老化、温度
+    变化、重新装夹的配准误差，实测这些合起来是 2-5% 的比值误差，而同帧
+    参考能到 0.3-0.5%——**5 到 15 倍**，是所有可用杠杆里最大的一个。
+
+    交叉通道版型（横向加抗体、纵向加抗原）让这件事几乎免费：留一条纵向
+    通道不加抗原即可，代价是 grid_size/grid_size² = 6.7% 的通量。
+    """
+
+    values = np.asarray(absorbance, dtype=np.float64).reshape(grid_size, grid_size)
+    column = int(reference_column) % grid_size
+    # 逐行减去该行参考点的读数。相减而非相除：吸光度已经是对数量，
+    # 对数域的差就是线性域的比，正是要对消的那个乘性共模。
+    corrected = values - values[:, column][:, None]
+    return corrected.reshape(-1)
+
+
 def calibration_run(
     base_config: ColorimetricConfig,
     assay: ImmunoassayResponse,
-    analyte_per_row: np.ndarray,
+    analyte_per_channel: np.ndarray,
     output_dir: str | Path,
     signal_channel: int | None = None,
+    axis: str = "column",
+    reference_column: int | None = None,
 ) -> dict[str, object]:
     """跑完整标定链路并给出回收率报告。
 
-    analyte_per_row 给出每一行（= 一条微流通道）的分析物浓度，行内 15 个
-    孔是重复孔。这与"横向加抗体、纵向加抗原"的交叉版型一致：一条通道
-    一个样品，行内重复给出误差棒。
+    analyte_per_channel 给出每条加样通道的分析物浓度，通道内的孔是重复孔。
+
+    axis 指明样品由哪个方向的通道送入。交叉版型是**横向通道加抗体、
+    纵向通道加抗原**，所以浓度按**列**变化、行内是不同抗体——默认
+    axis="column"。方向不是无关紧要的约定：若浓度由横向通道灌进整行，
+    那一行里就不可能存在"只通缓冲液"的孔，参考列在物理上不成立。
+
+    reference_column 指定一条只通缓冲液的纵向通道作为同帧空间参考。
     """
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     grid = base_config.grid_size
-    rows = np.asarray(analyte_per_row, dtype=np.float64).reshape(-1)
-    if rows.size != grid:
-        raise ValueError(f"analyte_per_row 需要 {grid} 个值，收到 {rows.size}")
+    channels = np.asarray(analyte_per_channel, dtype=np.float64).reshape(-1)
+    if channels.size != grid:
+        raise ValueError(f"analyte_per_channel 需要 {grid} 个值，收到 {channels.size}")
 
     # 分析物 → 显色产物。逐孔加固定化密度起伏。
     rng = np.random.default_rng(base_config.seed + 8801)
-    analyte = np.repeat(rows, grid)
+    if axis == "row":
+        analyte = np.repeat(channels, grid)          # 行内同浓度
+    else:
+        analyte = np.tile(channels, grid)            # 列内同浓度（默认）
+    if reference_column is not None:
+        grid_analyte = analyte.reshape(grid, grid)
+        grid_analyte[:, int(reference_column) % grid] = 0.0
+        analyte = grid_analyte.reshape(-1)
     chromogen = assay.chromogen_for(analyte, rng)
 
     config = ColorimetricConfig(**{
@@ -267,6 +309,13 @@ def calibration_run(
     y = absorbance[:, signal_channel]
     y_zero = zero_absorbance[:, signal_channel]
 
+    # 同帧参考列归一化：逐行减去该行参考孔的读数，对消照明梯度、曝光
+    # 波动、EL 漂移、温度与行间基线差异。参考孔与样品孔在同一帧图像里，
+    # 因此这些共模量是严格同时的，而不是隔着一小时孵育的。
+    if reference_column is not None:
+        y = apply_reference_column(y, grid, reference_column)
+        y_zero = apply_reference_column(y_zero, grid, reference_column)
+
     # 拟合只用图像里能得到的量：逐孔读数 + 已知的加样浓度。真值不参与。
     blank_mean = float(np.mean(y_zero))
     blank_sd = float(np.std(y_zero))
@@ -276,17 +325,21 @@ def calibration_run(
 
     recovered = model.invert(y)
 
-    # 逐浓度统计
+    # 逐浓度统计。分组方向与加样方向一致；参考列不作为浓度档参与统计。
     levels: list[dict[str, object]] = []
-    for index, nominal in enumerate(rows):
-        take = slice(index * grid, (index + 1) * grid)
-        got = recovered[take]
+    recovered_grid = recovered.reshape(grid, grid)
+    y_grid = y.reshape(grid, grid)
+    for index, nominal in enumerate(channels):
+        if reference_column is not None and index == int(reference_column) % grid:
+            continue
+        got = recovered_grid[index, :] if axis == "row" else recovered_grid[:, index]
+        y_take = y_grid[index, :] if axis == "row" else y_grid[:, index]
         valid = np.isfinite(got)
         entry: dict[str, object] = {
             "nominal": round(float(nominal), 6),
             "n": int(grid),
             "n_valid": int(valid.sum()),
-            "mean_absorbance": round(float(np.mean(y[take])), 5),
+            "mean_absorbance": round(float(np.mean(y_take)), 5),
         }
         if int(valid.sum()) >= 3 and nominal > 0:
             mean_got = float(np.mean(got[valid]))
@@ -333,6 +386,8 @@ def calibration_run(
         "quantitation_limit": loq,
         "usable_range": [min(usable), max(usable)] if usable else None,
         "usable_level_count": len(usable),
+        "axis": axis,
+        "reference_column": reference_column,
         "levels": levels,
     }
     with (output_dir / "calibration_report.json").open("w", encoding="utf-8") as f:
