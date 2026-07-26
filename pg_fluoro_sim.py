@@ -168,6 +168,21 @@ def concentration_to_emission(concentrations_uM, physics: Photophysics) -> np.nd
     return quantum_yield * absorbed * reabsorbed
 
 
+def turnover_concentration_uM(physics: Photophysics,
+                              search_max_uM: float = 1e5) -> float | None:
+    """内滤拐点浓度：发射强度到达峰值、越过后开始回落的位置。
+
+    越过拐点后同一读数对应两个浓度，反演在此失效；拐点以下曲线虽弯但
+    严格单调，可以直接反演。因此这个值就是"量程上界该定在哪"的答案。
+    返回 None 表示在 search_max_uM 以内单调，没有拐点。
+    """
+
+    grid = np.logspace(-4.0, math.log10(max(search_max_uM, 1.0)), 20000)
+    emission = concentration_to_emission(grid, physics)
+    peak = int(np.argmax(emission))
+    return None if peak >= grid.size - 2 else float(grid[peak])
+
+
 @dataclass
 class FluorescenceConfig:
     """荧光仿真参数。默认值对应"手机 + 暗箱 + 荧光滤光片"的典型场景。
@@ -1082,6 +1097,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmax", type=float, default=100.0, help="最高浓度 µM（默认 100µM）")
     parser.add_argument("--linear", action="store_true",
                         help="关闭内滤与自猝灭，强制 F ∝ c（用于对照）")
+    parser.add_argument("--path-mm", type=float, default=0.5,
+                        help="孔内液层光程 mm（默认 0.5）；决定内滤拐点位置，"
+                             "薄液层把拐点推远但抬高检出下限")
+    parser.add_argument("--epsilon", type=float, default=80000.0,
+                        help="激发波长处摩尔消光系数 M⁻¹cm⁻¹（默认荧光素钠 8e4）")
     parser.add_argument("--dataset", type=int, default=0, metavar="N",
                         help="生成 N 张带浓度真值的样本并汇总为标定数据集")
     parser.add_argument("--blanks", type=int, default=8, help="每张图的空白孔数（浓度 0）")
@@ -1114,7 +1134,33 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output)
 
-    physics = Photophysics(inner_filter=not args.linear, self_quenching=not args.linear)
+    physics = Photophysics(
+        path_length_cm=args.path_mm / 10.0, epsilon_M_cm=args.epsilon,
+        inner_filter=not args.linear, self_quenching=not args.linear,
+    )
+
+    def report_working_range() -> None:
+        """把光程换算成"量程上界该定在哪"，并检查请求量程是否越界。
+
+        拐点位置随 ε·l 变化，改一个参数就可能让原本可反演的量程滑进
+        不可反演区。这个检查放在生成之前，免得跑完一整批才发现上半段
+        的数据反演不了。
+        """
+
+        turnover = turnover_concentration_uM(physics)
+        if turnover is None:
+            print(f"液层 {args.path_mm}mm：搜索范围内无内滤拐点，全量程单调可反演")
+            return
+        print(f"液层 {args.path_mm}mm → 内滤拐点 {turnover:.1f} µM")
+        # 抖动会把孔推到名义上界之外，留出余量再判。
+        ceiling = args.cmax * (1.0 + 3.0 * FluorescenceConfig.concentration_jitter)
+        if ceiling >= turnover:
+            print(f"  ⚠ 请求上界 {args.cmax:g} µM（含移液抖动可达 {ceiling:.1f} µM）"
+                  f"已越过拐点，该段读数与低浓度侧简并、无法反演；"
+                  f"建议 --cmax ≤ {turnover * 0.85:.0f}")
+        elif ceiling >= turnover * 0.4:
+            print(f"  ⚠ 请求上界 {args.cmax:g} µM 已进入拐点附近的平坦段，"
+                  f"该处灵敏度低、反演误差放大；建议 --cmax ≤ {turnover * 0.4:.0f}")
 
     def build(**overrides) -> FluorescenceConfig:
         base = dict(
@@ -1141,7 +1187,9 @@ def main() -> None:
         print(f"PG-Fluoro-Sim 浓度标定数据集（{args.grid}x{args.grid}，"
               f"{args.cmin}–{args.cmax} µM，{args.dataset} 张）")
         print(f"荧光团: {physics.fluorophore}  内滤: {physics.inner_filter}  "
-              f"自猝灭: {physics.self_quenching}\n")
+              f"自猝灭: {physics.self_quenching}")
+        report_working_range()
+        print()
         manifest = build_concentration_dataset(
             output_dir, count=args.dataset, grid_size=args.grid,
             concentration_pattern=args.cpattern, blank_wells=args.blanks,

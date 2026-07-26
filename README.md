@@ -275,6 +275,17 @@ dataset command below, moving 3 mm → 0.5 mm pushed the turnover from 51 µM to
 295 µM but raised the LOD from 0.29 µM to 3.13 µM. Both are the same A, seen
 from two sides.
 
+`--path-mm` and `--epsilon` set the two factors of A from the command line,
+and the run reports the resulting turnover before generating anything — plus
+a warning when the requested `--cmax` (with pipetting jitter headroom) lands
+past it or in the flat region just below it, where sensitivity collapses:
+
+```
+$ python pg_fluoro_sim.py --grid 15 --concentration --path-mm 3.0 --cmax 100 --dataset 8 ...
+液层 3.0mm → 内滤拐点 51.5 µM
+  ⚠ 请求上界 100 µM（含移液抖动可达 115.0 µM）已越过拐点，读数与低浓度侧简并、无法反演；建议 --cmax ≤ 44
+```
+
 That LOD is set by **substrate autofluorescence**, not by read noise, so
 longer exposure does not lower it — the background scales with exposure too.
 Reaching lower concentrations needs a cleaner substrate or a better emission

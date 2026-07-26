@@ -323,6 +323,33 @@ def test_linear_mode_is_monotonic_and_continuous_with_nonlinear_at_dilute_limit(
     assert np.allclose(linear[dilute], nonlinear[dilute], rtol=1e-3)
 
 
+def test_turnover_tracks_path_length_and_is_absent_when_linear():
+    """拐点位置必须随液层厚度按 A = ε·c·l 移动，线性模式下不存在。
+
+    这是"量程上界该定在哪"的依据：改了光程或换了荧光团，可反演的上界
+    就跟着变，不该靠人记住。
+    """
+    from dataclasses import replace
+
+    from pg_fluoro_sim import Photophysics, turnover_concentration_uM
+
+    physics = Photophysics()
+    expected = {3.0: 51.5, 1.0: 151.6, 0.5: 295.4, 0.2: 690.2}
+    for mm, reference in expected.items():
+        measured = turnover_concentration_uM(replace(physics, path_length_cm=mm / 10.0))
+        assert measured is not None
+        assert abs(measured - reference) / reference < 0.02
+
+    # 拐点 ∝ 1/(ε·l)：加倍消光系数等价于加倍光程。
+    doubled_epsilon = turnover_concentration_uM(replace(physics, epsilon_M_cm=160000.0))
+    doubled_path = turnover_concentration_uM(replace(physics, path_length_cm=0.10))
+    assert abs(doubled_epsilon - doubled_path) / doubled_path < 0.02
+
+    # 线性模式严格单调，没有拐点可报。
+    assert turnover_concentration_uM(
+        Photophysics(inner_filter=False, self_quenching=False)) is None
+
+
 def test_truth_carries_absolute_concentration_and_photophysics(tmp_path):
     """浓度模式的真值必须含绝对浓度、单位、派生比例与光物理参数。"""
     from pg_fluoro_sim import FluorescenceConfig, write_fluorescence_sample
