@@ -377,8 +377,19 @@ class ColorimetricConfig:
 
     seed: int = 0
 
+    # 显式逐孔浓度（µM，行优先）。给定时完全取代 pattern 生成，供标定
+    # 流程把"分析物浓度经免疫反应模型换算出的显色产物浓度"直接灌进来。
+    explicit_concentrations: tuple[float, ...] | None = None
+
     def resolved_concentrations(self) -> np.ndarray:
         """逐孔浓度真值（µM，行优先）。"""
+
+        if self.explicit_concentrations is not None:
+            values = np.asarray(self.explicit_concentrations, dtype=np.float64).reshape(-1)
+            expected = self.grid_size * self.grid_size
+            if values.size != expected:
+                raise ValueError(f"explicit_concentrations 需要 {expected} 个值，收到 {values.size}")
+            return values.copy()
 
         rng = np.random.default_rng(self.seed + 3301)
         count = self.grid_size * self.grid_size
