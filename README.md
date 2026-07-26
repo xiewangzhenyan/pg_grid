@@ -13,7 +13,7 @@ No application-specific background is required to use or review this repository.
 - `pg_quant_viz.py`: unit-level visualizations (intensity/SNR heatmaps, corrected-color map, reliability overlay).
 - `pg_benchmark.py`: seeded synthetic perturbation benchmark (7 perturbation families) with degradation-curve reports and A/B comparison.
 - `pg_benchmark_demo.py`: command-line benchmark runner and report comparator.
-- `pg_fluoro_sim.py`: physically-modelled fluorescence array simulator with ground truth — generates emission images (wavelength→RGB, per-well intensities, optics, sensor noise) and evaluates the pipeline against the known truth.
+- `pg_fluoro_sim.py`: physically-modelled fluorescence array simulator with ground truth — generates emission images (wavelength→RGB, per-well intensities, optics, sensor noise) and evaluates the pipeline against the known truth. `--concentration` drives emission from **absolute fluorophore concentration** through an inner-filter/self-quenching model, and `--dataset N` pools the results into a calibration dataset.
 - `pg_unit_export.py`: per-unit tight cropping — exports every array unit as an
   individual background-free PNG with a manifest and a contact-sheet
   verification image.
@@ -233,6 +233,93 @@ python pg_fluoro_sim.py --grid 15 --output sim/f15 --evaluate
 python pg_fluoro_sim.py --grid 15 --output sim/scan --intensity-scan
 python pg_fluoro_sim.py --grid 15 --output sim/sweep --sweep
 ```
+
+### Concentration ground truth
+
+`--concentration` makes per-well **absolute concentration** the independent
+variable: concentration → photophysics → intensity → imaging chain. The truth
+JSON gains `concentrations` (µM), `concentration_unit`, a derived
+`concentration_fraction`, the `photophysics` parameters, and the
+`exposure_gain` used to convert relative emission into full-well fraction.
+
+The model is deliberately not linear, because fluorescein is not:
+
+```
+F = Φ_eff · (1 − 10^(−A))    · 10^(−overlap·A)   ,  A = ε·c·l
+    self-quench  primary IFE   secondary IFE (reabsorption)
+```
+
+Measured on the default parameters (ε = 8×10⁴ M⁻¹cm⁻¹, Φ = 0.92, l = 3 mm):
+
+| Concentration | Emission relative to a straight line through the origin |
+|---|---|
+| 1 nM – 100 nM | 100.0% (linear) |
+| 1 µM | 97.0% |
+| 10 µM | 74.2% |
+| 51 µM | 28.6% — **peak; the curve turns over here** |
+| 100 µM | 12.8%, and *dimmer* than 51 µM |
+
+That turnover is why the truth records absolute concentration rather than
+"percent of maximum". Past ~51 µM the same grey level corresponds to two
+different concentrations, and the position of that ambiguity is fixed in µM —
+a relative scale would slide it around with whatever `C_max` a consumer
+picked afterwards, and images with different ranges could not share one
+calibration curve. `--linear` disables both nonlinearities for an A/B control;
+it degenerates to the dilute-limit expansion so the two datasets coincide at
+low concentration and any difference is attributable to the nonlinearity
+itself.
+
+### Generating a calibration dataset
+
+`--dataset N` generates N images and pools every well into
+`calibration_pairs.csv` (concentration ↔ measured grey, with SNR, saturation
+and reliability flags) plus a `dataset_manifest.json`. Three properties make
+the pooled data usable rather than merely large:
+
+- **One exposure gain for the whole batch.** Per-image normalization would give
+  each image its own vertical axis; the pooled scatter would be several curves
+  that never meet.
+- **Real blank wells** (concentration exactly 0). Without a blank there is no
+  background, and LOD is defined by the blank's mean and spread.
+- **Images are gated on localization accuracy against the ground truth.** A
+  one-pitch shift silently pairs reading *k* with well *k+1*; the scatter plot
+  looks fine and the curve comes out wrong. Rejected images are listed with
+  their reason in the manifest.
+
+The requested range is clamped to what the exposure can actually resolve. The
+floor is set by **substrate autofluorescence plus filter leakage** (≈0.015
+full-well), an order of magnitude above read noise (≈5×10⁻⁴) — wells below it
+are not merely noisy, they are invisible, and a third of the array going dark
+makes lattice fitting drop rows entirely.
+
+```powershell
+python pg_fluoro_sim.py --grid 15 --concentration --dataset 8 --output sim/dataset
+```
+
+Measured on that command (8 images, 15×15, requested 1 nM–100 µM):
+
+| | |
+|---|---|
+| Effective range after clamping | 0.110 – 100 µM |
+| Images passing localization | 8/8, 1800 pooled pairs |
+| Blank background | −0.02 ± 0.33 grey |
+| Detection limit (blank + 3σ) | 0.292 µM |
+| Monotonic upper bound | 38.9 µM (turnover detected) |
+| Rank fidelity over the usable range | 0.991 |
+
+`plate_series` assigns one concentration per row (replicates within a row give
+the calibration curve its error bars) and **shuffles the row order**. Both
+reasons matter: a monotonic concentration gradient across the plate is fully
+confounded with the illumination gradient and vignetting, and it also bands
+the dimmest wells along one edge, where lattice fitting completes the grid on
+the wrong side — measured at ~110 %pitch mean error on 15×15 before the
+shuffle.
+
+One caveat is recorded in the manifest rather than left to be discovered:
+image rejection is not random. It favors layouts with dim rows near the edge,
+and edge wells are more strongly vignetted, so surviving images run slightly
+bright at the low end and the LOD is optimistic. Raising N dilutes it; nothing
+short of abandoning end-to-end evaluation removes it.
 
 `--intensity-scan` answers the practical question directly: it steps the
 overall emission level down and reports where localization stops working. On
