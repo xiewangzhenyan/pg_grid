@@ -131,13 +131,16 @@ def test_write_fluorescence_sample_emits_image_and_ground_truth(tmp_path):
 
     with truth_path.open("r", encoding="utf-8") as f:
         truth = json.load(f)
-    assert truth["schema"] == "pg-fluoro-truth-v1"
+    assert truth["schema"] == "pg-fluoro-truth-v2"
     assert truth["grid_size"] == 15
     assert len(truth["points"]) == 225
     assert len(truth["intensities"]) == 225
     assert truth["emission_nm"] == 530.0
     # 配置完整回写，保证可复现。
     assert truth["config"]["seed"] == 7
+    # 未启用浓度模式时浓度键必须存在且为 None——下游可以无条件取键判断。
+    assert truth["concentrations"] is None
+    assert truth["concentration_unit"] is None
 
 
 def test_pipeline_localizes_generated_fluorescence_image(tmp_path):
@@ -256,6 +259,230 @@ def test_bundled_fluo_failure_cases_never_fail_silently(tmp_path):
 
     assert not silent_failures, f"静默错误（trusted 但定位错）：{silent_failures}"
     assert accurate >= 15, f"仅 {accurate}/{len(cases)} 例被正确定位"
+
+
+def test_emission_is_non_monotonic_so_relative_labels_are_ambiguous():
+    """浓度→强度在量程内非单调，这正是真值必须记绝对浓度的理由。
+
+    发射强度到达峰值后因内滤效应回落，拐点两侧存在读数相同的两个浓度。
+    若真值只记"占最大浓度的百分比"，同一个百分比标签在不同 C_max 下对应
+    的物理位置会漂移，标注与图像里烘焙的非线性就对不上了。
+
+    拐点位置由 A = ε·c·l 决定，所以本测试分两段：模型必须能表达拐点
+    （物理事实），而默认的 0.5 mm 液层必须把它推到 1 nM–100 µM 之外
+    （实际可反演性）。液层加厚会把拐点拉进量程——一并断言，避免有人
+    改了 path_length_cm 却没意识到量程上半段已经不可反演。
+    """
+    from dataclasses import replace
+
+    from pg_fluoro_sim import Photophysics, concentration_to_emission
+
+    physics = Photophysics()
+    concentration = np.logspace(-3, 3.5, 4000)
+    emission = concentration_to_emission(concentration, physics)
+
+    peak = int(np.argmax(emission))
+    assert 0 < peak < len(concentration) - 1, "模型必须能表达内滤拐点"
+    assert emission[-1] < emission[peak], "越过拐点后强度必须回落"
+
+    # 拐点左侧存在与量程上端读数相同的浓度：单凭读数无法区分二者。
+    twin = int(np.argmin(np.abs(emission[:peak] - emission[-1])))
+    assert concentration[twin] < concentration[peak] < concentration[-1]
+    assert abs(emission[twin] - emission[-1]) / emission[-1] < 0.02
+
+    # 默认 0.5 mm 液层：1 nM–100 µM 全程严格单调，因而可反演。
+    working = np.logspace(-3, 2, 4000)
+    assert np.all(np.diff(concentration_to_emission(working, physics)) > 0)
+    assert concentration[peak] > 100.0
+
+    # 液层加厚到 3 mm，拐点前移进量程，上半段不再可反演。
+    thick = concentration_to_emission(working, replace(physics, path_length_cm=0.30))
+    assert np.any(np.diff(thick) < 0)
+
+
+def test_linear_mode_is_monotonic_and_continuous_with_nonlinear_at_dilute_limit():
+    """关掉内滤后必须严格单调，且低浓度端与非线性模式数值连续。
+
+    连续性是刻意的：两种模式在稀释极限重合，才能把"线性假设下训练的
+    模型在真实非线性数据上掉多少"归因于非线性本身，而不是归因于两套
+    数据用了不同的比例系数。
+    """
+    from pg_fluoro_sim import Photophysics, concentration_to_emission
+
+    concentration = np.logspace(-3, 2, 500)
+    nonlinear = concentration_to_emission(concentration, Photophysics())
+    linear = concentration_to_emission(
+        concentration, Photophysics(inner_filter=False, self_quenching=False))
+
+    assert np.all(np.diff(linear) > 0)
+    # 线性模式下读数与浓度严格成比例。
+    ratio = linear / concentration
+    assert float(ratio.std() / ratio.mean()) < 1e-9
+    # 稀释极限（≤10 nM）两模式相对偏差 < 0.1%。
+    dilute = concentration <= 0.01
+    assert np.allclose(linear[dilute], nonlinear[dilute], rtol=1e-3)
+
+
+def test_truth_carries_absolute_concentration_and_photophysics(tmp_path):
+    """浓度模式的真值必须含绝对浓度、单位、派生比例与光物理参数。"""
+    from pg_fluoro_sim import FluorescenceConfig, write_fluorescence_sample
+
+    config = FluorescenceConfig(
+        grid_size=10, image_size=700, concentration_pattern="log_series",
+        concentration_min_uM=0.001, concentration_max_uM=100.0, seed=17,
+    )
+    paths = write_fluorescence_sample(config, tmp_path, name="conc")
+    with Path(paths["ground_truth"]).open("r", encoding="utf-8") as f:
+        truth = json.load(f)
+
+    concentrations = np.asarray(truth["concentrations"], dtype=np.float64)
+    fractions = np.asarray(truth["concentration_fraction"], dtype=np.float64)
+    assert truth["concentration_unit"] == "uM"
+    assert concentrations.shape == (100,)
+    assert concentrations.min() >= 0.0 and concentrations.max() <= 200.0
+    # 派生比例必须与绝对浓度一致，且以本图最大浓度为 1。
+    assert np.isclose(fractions.max(), 1.0)
+    assert np.allclose(fractions, concentrations / concentrations.max(), atol=1e-6)
+
+    physics = truth["photophysics"]
+    assert physics["fluorophore"] == "fluorescein"
+    assert physics["inner_filter"] is True
+    assert truth["exposure_gain"] > 0.0
+    # 强度是导出量，必须与浓度同为 0 / 同为正。
+    intensities = np.asarray(truth["intensities"], dtype=np.float64)
+    assert np.array_equal(concentrations > 0, intensities > 0)
+
+
+def test_intensity_is_derived_from_concentration_not_the_reverse():
+    """浓度模式下改光物理参数必须改变强度：因果方向是浓度→强度。"""
+    from dataclasses import replace
+
+    from pg_fluoro_sim import FluorescenceConfig, Photophysics
+
+    base = FluorescenceConfig(
+        grid_size=10, concentration_pattern="log_series",
+        concentration_min_uM=0.001, concentration_max_uM=100.0,
+        concentration_jitter=0.0, exposure_gain=1.5, seed=3,
+    )
+    linear = replace(base, photophysics=Photophysics(inner_filter=False, self_quenching=False))
+
+    nonlinear_values = base.resolved_intensities()
+    linear_values = linear.resolved_intensities()
+    assert not np.allclose(nonlinear_values, linear_values)
+    # 高浓度端被内滤压缩，低浓度端两者一致。
+    assert nonlinear_values[-1] < linear_values[-1]
+    assert np.isclose(nonlinear_values[0], linear_values[0], rtol=1e-3)
+
+
+def test_fixed_exposure_gain_keeps_concentrations_comparable_across_images():
+    """整批共用曝光增益后，同一浓度在不同图上必须给出同一强度。
+
+    这是"绝对浓度"能跨图汇总的前提。反例同时验证：自动定标下每张图按
+    自己的峰值归一化，同一浓度读数不同——公共纵轴消失，多张图的散点
+    没法合成一条标定曲线。
+    """
+    from dataclasses import replace
+
+    from pg_fluoro_sim import FluorescenceConfig
+
+    narrow = FluorescenceConfig(
+        grid_size=10, concentration_pattern="log_series",
+        concentration_min_uM=0.001, concentration_max_uM=10.0,
+        concentration_jitter=0.0, seed=1,
+    )
+    wide = replace(narrow, concentration_max_uM=100.0)
+    # 两图最低浓度相同（0.001 µM），是可比性的探针。
+    assert np.isclose(narrow.resolved_concentrations()[0], wide.resolved_concentrations()[0])
+
+    # 自动定标：同一浓度读数不同。
+    assert not np.isclose(
+        narrow.resolved_intensities()[0], wide.resolved_intensities()[0], rtol=0.05)
+
+    # 共用增益：同一浓度必须给出同一强度。
+    gain = narrow.resolved_exposure_gain()
+    assert np.isclose(
+        replace(narrow, exposure_gain=gain).resolved_intensities()[0],
+        replace(wide, exposure_gain=gain).resolved_intensities()[0],
+        rtol=1e-9,
+    )
+
+
+def test_summarize_calibration_pairs_finds_lod_and_inner_filter_turnover():
+    """汇总必须同时定位检出下限与内滤拐点。
+
+    拐点（默认 0.5 mm 液层下约 295 µM）与量程上端同处 [100,1000) 一个十倍
+    档内，因此不能靠档间比较中位数发现它——本测试正是针对这一点。
+    """
+    from pg_fluoro_sim import Photophysics, concentration_to_emission, summarize_calibration_pairs
+
+    rng = np.random.default_rng(0)
+    physics = Photophysics()
+    concentration = np.logspace(-3, 3, 900)
+    gray = concentration_to_emission(concentration, physics) * 300.0
+    gray = gray + rng.normal(0.0, 0.4, gray.size)
+
+    rows = [{"concentration_uM": float(c), "measured_gray": float(g)}
+            for c, g in zip(concentration, gray)]
+    rows += [{"concentration_uM": 0.0, "measured_gray": float(v)}
+             for v in rng.normal(0.0, 0.4, 40)]
+
+    summary = summarize_calibration_pairs(rows)
+    assert summary["detection_limit_uM"] is not None
+    # 检出下限必须显著低于拐点：可用区间要能跨至少一个半数量级，
+    # 否则"可反演"就成了空话。
+    assert 0.001 <= summary["detection_limit_uM"] <= 10.0
+    assert summary["monotonic_max_uM"] / summary["detection_limit_uM"] > 30.0
+    assert summary["turnover_detected"] is True
+    # 理论拐点 295 µM；容差覆盖噪声与滑动中位数窗口的影响。
+    assert 150.0 <= summary["monotonic_max_uM"] <= 600.0
+    assert summary["spearman_usable"] > 0.95
+
+
+def test_build_concentration_dataset_pools_pairs_and_gates_on_localization(tmp_path):
+    """数据集必须汇总浓度-灰度配对、共用曝光增益、并按定位精度筛图。"""
+    import csv
+
+    from pg_fluoro_sim import build_concentration_dataset
+
+    # 两个实测约束（均为既有管线行为，与浓度改动无关），故意用 10×10 这个
+    # 更严苛的规格：900px 时孔斑过小、支撑率跌到 0.01–0.27；ideal 预设在
+    # 10×10 上系统性失败（支撑 0.03–0.10，锐利合成方块反而难检出），而在
+    # 15×15 上四种预设都是 3/3。
+    manifest = build_concentration_dataset(
+        tmp_path, count=3, grid_size=10, concentration_pattern="plate_series",
+        difficulties=("typical", "hard"), blank_wells=6,
+        base_overrides={"image_size": 1200},
+    )
+
+    assert manifest["schema"] == "pg-fluoro-dataset-v1"
+    assert manifest["concentration_unit"] == "uM"
+    assert manifest["image_count"] == 3
+    assert manifest["included_image_count"] >= 2
+    assert manifest["pair_count"] == manifest["included_image_count"] * 100
+
+    # 曝光增益整批唯一：每张图的真值都必须回写同一个值。
+    gains = set()
+    for sample in manifest["samples"]:
+        with Path(sample["ground_truth"]).open("r", encoding="utf-8") as f:
+            gains.add(json.load(f)["exposure_gain"])
+    assert len(gains) == 1
+    assert abs(gains.pop() - manifest["exposure_gain"]) < 1e-6
+
+    # 每张图的筛选结论必须可复核。
+    for sample in manifest["samples"]:
+        assert (sample["excluded_reason"] is None) == sample["included"]
+
+    with Path(manifest["outputs"]["calibration_pairs_csv"]).open(encoding="utf-8") as f:
+        pairs = list(csv.DictReader(f))
+    assert len(pairs) == manifest["pair_count"]
+    assert {"concentration_uM", "measured_gray", "reliable", "snr"} <= set(pairs[0])
+    # 空白孔（浓度 0）必须进入数据集——没有本底就定不出检出下限。
+    assert sum(1 for p in pairs if float(p["concentration_uM"]) == 0.0) >= 6
+
+    calibration = manifest["calibration"]
+    assert calibration["detection_limit_uM"] is not None
+    assert calibration["blank_std_gray"] >= 0.0
+    assert len(calibration["decades"]) >= 3
 
 
 def test_evaluate_generated_sample_reports_per_decade_detection(tmp_path):
