@@ -54,12 +54,28 @@ The current implementation follows this pipeline:
    contour (≈0.9–1.0) from a fragment carved out of the panel interior (≈0.5).
 2. Rectify the region into a canonical square view.
 3. Fit a physically constrained grid from blob candidates: black-hat enhanced
-   dark squares for 10x10, top-hat enhanced bright dots for 15x15. A small
-   angle sweep first estimates the residual lattice rotation left over after
-   rectification, the candidates are de-rotated, row/column clusters are
-   matched against a regular equally spaced axis model, and the resulting grid
-   is rotated back. Projection-peak fitting and the uniform physical grid stay
-   as fallbacks.
+   dark units, top-hat enhanced bright units, selected by the detected
+   polarity rather than by grid size. A small angle sweep first estimates the
+   residual lattice rotation left over after rectification, the candidates are
+   de-rotated, row/column clusters are matched against a regular equally
+   spaced axis model, and the resulting grid is rotated back. Projection-peak
+   fitting and the uniform physical grid stay as fallbacks.
+
+   The detectors' geometric gates and the axis pitch window are anchored to
+   the 15x15 reference and converted by unit pitch, because a unit's pixel
+   size tracks `side*(1-2*margin)/(grid_size-1)` rather than the canvas side.
+   Expressing them as fractions of the side silently encoded `grid_size ≈ 15`;
+   at 10x10 that rejected normal units for exceeding `max_area` and left the
+   axis pitch window with 3% headroom instead of 60%.
+
+   An axis whose clusters are incomplete is completed against the regular
+   lattice prior, tolerating up to half the rows or columns missing. Whole
+   dark rows are the norm rather than the exception for self-luminous arrays:
+   a log dilution series puts its dimmest wells below the substrate
+   autofluorescence floor, leaving 6 of 10 rows detectable at 10x10 and 9 of
+   15 at 15x15. When one axis resolves and the other does not, the resolved
+   axis supplies its pitch as a prior — a square array has the same pitch on
+   both axes, and rows going dark together leaves the column axis intact.
 4. Refine each local center with component-level constraints.
 5. Lattice bundle adjustment (V2.0): local refinement collects observations
    with real image evidence, an 8-DoF homography over `(row, col) -> (x, y)`
@@ -334,12 +350,18 @@ Measured on that command (8 images, 15×15, requested 1 nM–100 µM):
 
 Per-preset yield at 15×15, 3 images each: `ideal` 3/3, `typical` 3/3, `hard`
 3/3, `extreme` 2/3, with 1.3–3.7 %pitch localization error on the passing
-images. At **10×10** the `ideal` preset fails systematically instead (candidate
-support 0.03–0.10): razor-sharp synthetic squares with almost no defocus are
-harder for the blob detector than realistically blurred ones. That is
-pre-existing pipeline behavior on synthetic input, not a property of the
-concentration model, but it is why the dataset tests exercise 10×10 with
-`typical`/`hard`.
+images.
+
+**10×10 used to fail systematically here, and the explanation recorded in this
+file was wrong.** The symptom was that sharper scenes did worse than blurred
+ones — `ideal` (defocus 0.6) collapsed while `hard` (defocus 2.2) worked — and
+that was read as "razor-sharp synthetic squares are harder for the blob
+detector." The actual cause was a `max_area` ceiling that scaled with the
+canvas side instead of the unit pitch, so a normal 10×10 unit was rejected for
+being *too large*; defocus rescued the case by shrinking each unit's
+above-threshold core until it slipped back under the ceiling. Both detectors'
+gates are now anchored to the 15×15 reference and converted by unit pitch, and
+the `--sweep` numbers below are what the pipeline actually does.
 
 `plate_series` assigns one concentration per row (replicates within a row give
 the calibration curve its error bars) and **shuffles the row order**. Both
@@ -361,6 +383,57 @@ the default 15×15 configuration the pipeline is reliable down to a peak of
 about 20 grey levels (support 0.71, localization 1.98 %pitch, rank fidelity
 0.989) and fails cleanly below roughly 10 grey levels — flagging
 `trusted=false` rather than returning a wrong grid.
+
+### Localization accuracy baseline
+
+Mean localization error against the simulator's ground truth, from
+`python pg_fluoro_sim.py --grid {10,15} --output <dir> --sweep`:
+
+| preset | 10×10 | 15×15 |
+|---|---|---|
+| `ideal` | 1.46 %pitch | 2.00 %pitch |
+| `typical` | 2.71 %pitch | 4.19 %pitch |
+| `hard` | 3.96 %pitch | 103.50 %pitch |
+| `extreme` | 5.33 %pitch | 9.96 %pitch |
+
+Error is dominated by the wells that are physically invisible rather than by
+geometry: broken out by intensity decade, wells above 0.1 full-well localize to
+0.43–0.84 %pitch with rank fidelity ≥0.99, while wells in the 0.001–0.01 decade
+— at or below the substrate autofluorescence floor — contribute 2–14 %pitch.
+
+Two known defects remain, both visible in that table:
+
+- **15×15 `hard` is a whole-lattice one-pitch row shift.** Row *r* of the fitted
+  grid sits on ground-truth row *r+1*: the true top row is never claimed and a
+  phantom row is invented one pitch past the bottom edge. Comparing against
+  `truth[r+1][c]` collapses the residual from 103.50 to 4.93 %pitch, so the
+  geometry is right and only the index assignment is off. All three arbitration
+  signals are ratios over the shared rows, so none of them move — coverage and
+  support are bit-identical between the wrong grid and the corrected one. The
+  run does report `trusted=false`, so the never-fail-silently contract holds,
+  but it holds by luck rather than by detection.
+- **The trust flag cries wolf.** `candidate_support_ratio` is bounded above by
+  the fraction of wells that are physically visible; across the sweep and scan
+  runs it lands at a near-constant 0.71–0.75 of that fraction, and a log
+  dilution series leaves only ~0.72–0.77 of wells above the floor. Support
+  therefore settles around 0.52–0.57, just under the 0.6 gate, for runs that
+  localize to 1.5–4 %pitch. Measured on `examples/fluo/`, 8 of the 18 correctly
+  localized cases are flagged untrusted while all 6 genuine failures are caught
+  — no misses, but a 44% false-alarm rate.
+
+These interact, which fixes the order of work: the support gate cannot simply be
+lowered, because at 0.55 it cannot distinguish 10×10 `ideal` (1.46 %pitch) from
+15×15 `hard` (103.50 %pitch) — they report the same support. An evidence-based
+shift detector has to land first; only then can the gate be recalibrated
+without opening a silent-failure hole.
+
+A lattice-anisotropy test (row pitch versus column pitch, which the one-pitch
+shift distorts by 9.9%) was evaluated for that role and **rejected by
+measurement**: the real 10×10 photographs reach 0.08–0.11 anisotropy while
+localizing correctly, because connectors and channel lines pull the region box
+out of alignment with the array, and `partial_region_hard_0006` fails at
+123 %pitch with 0.0003 anisotropy because a pure translation preserves both
+pitches. No threshold separates the two populations.
 
 Self-luminous arrays have no continuous bright panel, so region detection
 degrades through two dedicated paths, ordered by how reliable their geometric
