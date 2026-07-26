@@ -382,7 +382,17 @@ overall emission level down and reports where localization stops working. On
 the default 15×15 configuration the pipeline is reliable down to a peak of
 about 20 grey levels (support 0.71, localization 1.98 %pitch, rank fidelity
 0.989) and fails cleanly below roughly 10 grey levels — flagging
-`trusted=false` rather than returning a wrong grid.
+`trusted=false` rather than returning a wrong grid. 10×10 now holds the same
+envelope: 0.33–0.50 %pitch from 166 down to 41 grey levels, 1.82 %pitch with
+rank fidelity 0.987 at 20 grey levels, `trusted=false` from 10 grey levels
+down.
+
+The trust flag is fully correct on this scan — true for all four working
+levels, false for all five failing ones — which locates the false-alarm
+problem described below precisely: it appears only when a single image spans a
+wide intensity range. Scaling the whole array together keeps support at
+0.74–1.00, whereas a dilution series leaves a fixed fraction of wells under
+the floor and caps support near 0.55 regardless of how good the geometry is.
 
 ### Localization accuracy baseline
 
