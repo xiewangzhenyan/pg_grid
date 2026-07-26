@@ -504,10 +504,24 @@ simulator, matching the v4.2 hardware's colorimetric mode: a white EL panel
 backlights the chip through a black PMMA mask (15×15 square apertures, 0.5 mm
 on a 1.0 mm pitch), and the phone photographs the array from above.
 
-Geometrically this looks like the fluorescence case — bright wells on a dark
-field, so the pipeline still detects `polarity=bright`. Physically it is the
-inverse: wells get **darker** with concentration, and the measured quantity is
-`A = -log10(I_sample / I_blank)` rather than an emission level. Everything
+The black mask is optional, and the two cases are opposite in polarity, so
+`layout` selects between them:
+
+- `bare` (default) — no mask. The substrate is lit through and each reaction
+  zone darkens it, giving dark spots on a bright field (`polarity=dark`). This
+  is what the current chip photographs as.
+- `masked` — mask fitted. `mask_transmittance` sets how opaque it is: ≈0.002
+  for matte black PMMA, which gives bright apertures on a black field
+  (`polarity=bright`), and 0.1–0.4 for a translucent 3D-printed PDMS mask,
+  which lands in between.
+
+The mask is modelled as a multiplicative layer — 1.0 inside the apertures,
+`mask_transmittance` over the body — so all three cases come from one formula,
+and `mask_transmittance = 1` degenerates exactly to `bare`.
+
+Physically the measurement is the inverse of fluorescence: wells get **darker**
+with concentration, and the quantity is `A = -log10(I_sample / I_blank)`
+rather than an emission level. Everything
 downstream of scene radiance — geometry, defocus, vignetting, sensor noise,
 quantization — is shared with `pg_fluoro_sim` through `apply_optics_and_sensor`
 so the two modes cannot drift apart in what they claim about noise or SNR.
@@ -567,6 +581,39 @@ Measured on `--sweep` at 15×15:
 Channel selectivity behaves as it should: for the yellow product the blue
 channel reaches A = 1.34 while red only reaches 0.047, so the readout carries
 colour information rather than just brightness.
+
+### Is a leaky mask worth fitting?
+
+`--mask-study` sweeps `mask_transmittance` and reports both what the mask buys
+and what it costs, because they pull in opposite directions. The mask helps
+**localization**: it gives every spot a hard-edged aperture, so a faint spot is
+still findable. It costs **photometry**: light through the mask body bleeds
+into the ROI and flattens the curve, `A = -log10((I+L)/(I_blank+L))`.
+
+Measured at 15×15 over 50–3000 µM of TMB's blue radical (true A_max = 1.077):
+
+| mask transmittance | localization | support | A bias | A RMSE | Spearman |
+|---|---|---|---|---|---|
+| 0.002 (black PMMA) | 1.95 %pitch | 1.000 | −0.008 | 0.012 | 0.9997 |
+| 0.10 | 1.98 %pitch | 1.000 | −0.018 | 0.033 | 0.9990 |
+| 0.30 | 2.15 %pitch | 1.000 | −0.035 | 0.063 | 0.9970 |
+| 0.50 | 4.54 %pitch | 0.778 | −0.079 | 0.166 | 0.9541 |
+| none (`bare`) | 4.46 %pitch | 0.671 | **−0.262** | **1.055** | 0.768 |
+
+The result is counterintuitive and worth stating plainly: **a mask that leaks
+badly still beats no mask by a wide margin.** Even at 30% body transmittance
+the absorbance RMSE is 0.063 against a signal of 1.08, while removing the mask
+entirely pushes RMSE to 1.055 — as large as the signal itself. The knee sits
+between 0.3 and 0.5, so a PDMS mask is worth fitting as long as it is under
+roughly a third transmittance.
+
+The mechanism is not mainly stray light. It is what surrounds each spot. With a
+mask the surround is dark, so PSF bleed and ROI misalignment add almost nothing
+to the ROI. Without one the surround is the bright substrate, and the same
+bleed adds substrate-bright signal straight into the measurement, compressing
+absorbance toward zero. A bright surround is far less forgiving of small
+localization error than a dark one — which is also why the `bare` column
+degrades so much faster than its 4.46 %pitch localization would suggest.
 
 ### Colorimetry makes the whole-lattice shift blind spot worse
 

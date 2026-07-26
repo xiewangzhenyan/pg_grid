@@ -4,3 +4,11 @@ outputs/
 annotations/
 reports/
 *.pyc
+
+# 管线与仿真的运行产物：叠图、热图、result/quant JSON、CSV 等。
+# 全部可由命令重新生成，因此不入库（见 README「Images are generated on
+# demand and never committed」）。
+_abrun/
+sim/
+crops/
+*_eval/

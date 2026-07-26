@@ -8,10 +8,10 @@
 与 pg_fluoro_sim 的根本差异只有一处：**辐射来源**。荧光是自发光；
 比色是背光透射，浓度越高越**暗**——方向与荧光相反。
 
-版面形态有两种，见 ColorimetricConfig.layout。实拍芯片是"亮的散射基底
-+ 深色反应点"（polarity=dark），而 v4.2 文档描述的是"黑罩 + 225 个透光
-方孔"（polarity=bright）。两者对定位管线是**不同的检测器通路**，因此
-两种都要能生成；默认取实拍那一种。
+版面形态见 ColorimetricConfig.layout / mask_transmittance。不装黑罩时是
+"亮的散射基底 + 深色反应点"（polarity=dark，当前实拍芯片的样子）；装
+理想不透光黑罩时是"黑底 + 亮孔"（polarity=bright，v4.2 文档的形态）。
+半透光的 PDMS 罩落在两者之间，且会在图内翻转极性——见 --mask-study。
 
 成像链（几何 → 光学 → 传感器）与荧光完全共用 pg_fluoro_sim 的实现，
 不另写一份，避免两种模式的噪声/满阱/量化口径各自漂移。
@@ -122,6 +122,91 @@ CHROMOPHORES: dict[str, Chromophore] = {
 }
 
 
+def _lorentz_band(peak_nm: float, fwhm_nm: float) -> np.ndarray:
+    """归一化到峰值 1.0 的洛伦兹带。等离激元共振是阻尼振子，尾巴比高斯重。"""
+
+    half = max(float(fwhm_nm), 1e-6) / 2.0
+    return 1.0 / (1.0 + ((LAMBDA_NM - float(peak_nm)) / half) ** 2)
+
+
+@dataclass
+class PlasmonResonance:
+    """金纳米结构阵列的局域表面等离激元共振带（无标记 LSPR 传感）。
+
+    与 Chromophore 的物理**完全不同**，不是同一个模型换参数：
+
+    - 显色剂：吸收带位置固定，浓度让它**加深**。读数是吸光度，A ∝ c。
+    - 等离激元：消光带深度基本固定，结合让它**移动**。读数必须是通道比值；
+      对峰移取 −log10(I/I₀) 会把位移和幅度揉进一个数，信息反而丢失。
+
+    剂量响应是抗原抗体亲和结合，服从 Langmuir 等温式而不是线性关系：
+
+        Δλ(c) = Δλ_max · c / (K_D + c)
+
+    只有 c ≪ K_D 时才近似线性。跨一个数量级以上仍用线性拟合，高浓度端
+    会系统性偏低，这是标定曲线最常见的一个错误。
+    """
+
+    name: str = "annealed Au island array"
+    peak_nm: float = 630.0            # 未结合时的共振峰位
+    fwhm_nm: float = 110.0            # 线宽
+    extinction_depth: float = 0.45    # 峰处消光深度 1 − T_min
+    shift_max_nm: float = 4.0         # 饱和结合时的峰移
+    kd_uM: float = 0.05               # 解离常数（决定动态范围位置）
+
+    def shift_for(self, concentrations_uM: np.ndarray) -> np.ndarray:
+        """Langmuir 结合 → 峰移 (nm)。"""
+
+        c = np.clip(np.asarray(concentrations_uM, dtype=np.float64), 0.0, None)
+        return self.shift_max_nm * c / (self.kd_uM + c)
+
+    def transmittance_spectrum(self, shift_nm: np.ndarray) -> np.ndarray:
+        """逐孔透射谱 T(λ)，形状 (N, len(LAMBDA_NM))。"""
+
+        shift = np.asarray(shift_nm, dtype=np.float64).reshape(-1, 1)
+        half = max(self.fwhm_nm, 1e-6) / 2.0
+        detune = (LAMBDA_NM[None, :] - (self.peak_nm + shift)) / half
+        return 1.0 - self.extinction_depth / (1.0 + detune ** 2)
+
+
+def plasmon_channel_transmittance(
+    concentrations_uM: np.ndarray,
+    plasmon: PlasmonResonance,
+    source: np.ndarray | None = None,
+    response: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """浓度 → (逐通道透射率 (N,3) RGB, 逐孔峰移 (N,))。
+
+    与显色剂路径的关键差异：c=0 时透射率**不是 1.0**——金阵列本身就有
+    消光。所以"空白"是"未结合的金阵列"，而不是"什么都没有"。
+    """
+
+    if source is None:
+        source = el_source_spectrum()
+    if response is None:
+        response = camera_channel_response()
+
+    shift = plasmon.shift_for(concentrations_uM)
+    spectra = plasmon.transmittance_spectrum(shift)      # (N, L)
+    weight = source[None, :] * response                  # (3, L)
+    channels = spectra @ weight.T / weight.sum(axis=1)[None, :]
+    return channels, shift
+
+
+def channel_ratio(transmittance: np.ndarray, pair: str = "RG") -> np.ndarray:
+    """通道比值读数。峰移改变通道间的相对强弱，比值即信号。
+
+    比值天然对消曝光、光源亮度、照明梯度这些共模量——它们同等地作用于
+    两个通道。这正是等离激元读数应当用比值而不是绝对值的原因。
+    """
+
+    index = {"R": 0, "G": 1, "B": 2}
+    t = np.asarray(transmittance, dtype=np.float64)
+    numerator = t[:, index[pair[0]]]
+    denominator = np.clip(t[:, index[pair[1]]], 1e-12, None)
+    return numerator / denominator
+
+
 def el_source_spectrum(blue_peak_nm: float = 490.0, blue_fwhm_nm: float = 70.0,
                        amber_peak_nm: float = 590.0, amber_fwhm_nm: float = 90.0,
                        amber_ratio: float = 0.75) -> np.ndarray:
@@ -203,17 +288,21 @@ class ColorimetricConfig:
     well_shape: str = "square"        # 方形反应区
     supersample: int = 2
 
-    # 版面形态。两者的 Beer-Lambert 物理完全相同，差别只在**光从哪里透过**：
+    # 版面形态。Beer-Lambert 物理两者完全相同，差别只在**有没有遮罩层**：
     #
-    # - "substrate"（默认）：亮的散射基底整片透光，反应区因显色而**变暗**。
-    #   这是实拍 15×15 芯片的真实样子——白色膜基底上一格格深色反应点，
-    #   定位管线判定为 polarity=dark。
-    # - "mask"：黑色 PMMA 罩挡光、225 个方孔透光，孔即反应区，
-    #   polarity=bright。这是 v4.2 文档描述的形态。
+    # - "bare"（默认）：不装黑罩。亮的散射基底整片透光，反应区因显色而
+    #   变暗，定位管线判定 polarity=dark。这是当前实拍芯片的样子。
+    # - "masked"：装黑罩。罩体透过率由 mask_transmittance 给出，孔内为 1.0。
     #
-    # 两者对定位算法是**完全不同的通路**（暗方块检测器 vs 亮点检测器），
-    # 所以仿真必须能生成实际会拍到的那一种，否则验证的是另一条代码路径。
-    layout: str = "substrate"         # substrate | mask
+    # 两者对定位算法是**不同的检测器通路**（暗方块 vs 亮点），所以必须能
+    # 生成实际会拍到的那一种，否则验证的是另一条代码路径。
+    layout: str = "bare"              # bare | masked
+    # 罩体透过率。理想 1 mm 哑光黑 PMMA 约 0.002；PDMS 3D 打印的黑罩会
+    # 明显透光，实测量级通常在 0.1–0.4，这正是"装了还不如不装"的原因：
+    # 当显色透射率降到罩体透过率以下（A > −log10(T_mask)）时，该孔变得比
+    # 罩体还暗，同一张图里极性不再一致。用 --mask-study 可以直接扫出
+    # 自己那批 PDMS 罩需要压到多少才有增益。
+    mask_transmittance: float = 0.002
 
     # --- 显色化学 ---
     concentration_pattern: str = "log_series"  # log_series | plate_series | gradient | uniform | random | checker
@@ -226,6 +315,31 @@ class ColorimetricConfig:
     concentration_jitter: float = 0.05
     blank_well_count: int = 8         # 浓度恰为 0 的空白孔，标定必需
     chromophore: Chromophore = field(default_factory=Chromophore)
+
+    # 信号模型。两者物理不同，不是同一模型换参数：
+    # - "dye"：显色剂，吸收带固定、浓度让它加深，读吸光度。
+    # - "plasmon"：无标记 LSPR，共振峰随结合而移动，读通道比值。
+    #   金纳米阵列芯片属于后者——空白不是"透明"，而是"未结合的金阵列"。
+    signal_model: str = "dye"         # dye | plasmon
+    plasmon: PlasmonResonance = field(default_factory=PlasmonResonance)
+    ratio_pair: str = "RG"            # 比值读数用哪两个通道
+
+    # 金纳米阵列本身的消光。它**始终存在**，与显色产物是叠加关系而不是
+    # 二选一：光先穿过金阵列，再穿过沉积在其上的显色产物。
+    #   T_斑点 = T_金 × T_显色产物(c)
+    # 对定量的影响：金的消光在样品图和空白图里完全相同，取比值时精确
+    # 对消，因此**不会引入偏差**——它只是让整体透过率变低、光子数变少，
+    # 代价体现在信噪比而不是准确度上。
+    # 设为 None 表示无金阵列（普通显色芯片）。
+    array_plasmon: PlasmonResonance | None = None
+
+    # 参考列：该列只通缓冲液、不加抗原，作为同帧空间参考。
+    # 交叉通道版型（横向加抗体、纵向加抗原）让这件事几乎免费——牺牲
+    # 15/225 = 6.7% 通量，换来照明漂移、曝光波动、温度、行间基线差异
+    # 的共模对消，而且参考点与样品点在**同一帧**里。
+    # 时序参考（加抗原前后各拍一张）要跨越孵育、清洗、重新装夹，
+    # 中间的漂移往往比 1-5 nm 的信号还大。
+    reference_column: int | None = None
 
     # --- 曝光 ---
     blank_level: float = 0.85         # 空白孔的满阱分数；留 15% 余量防饱和
@@ -263,8 +377,19 @@ class ColorimetricConfig:
 
     seed: int = 0
 
+    # 显式逐孔浓度（µM，行优先）。给定时完全取代 pattern 生成，供标定
+    # 流程把"分析物浓度经免疫反应模型换算出的显色产物浓度"直接灌进来。
+    explicit_concentrations: tuple[float, ...] | None = None
+
     def resolved_concentrations(self) -> np.ndarray:
         """逐孔浓度真值（µM，行优先）。"""
+
+        if self.explicit_concentrations is not None:
+            values = np.asarray(self.explicit_concentrations, dtype=np.float64).reshape(-1)
+            expected = self.grid_size * self.grid_size
+            if values.size != expected:
+                raise ValueError(f"explicit_concentrations 需要 {expected} 个值，收到 {values.size}")
+            return values.copy()
 
         rng = np.random.default_rng(self.seed + 3301)
         count = self.grid_size * self.grid_size
@@ -296,6 +421,11 @@ class ColorimetricConfig:
         if self.blank_well_count > 0:
             blanks = rng.choice(count, size=min(self.blank_well_count, count), replace=False)
             values[blanks] = 0.0
+
+        if self.reference_column is not None:
+            # 参考列只通缓冲液：整列浓度置零，且不受移液抖动影响。
+            column = int(self.reference_column) % self.grid_size
+            values.reshape(self.grid_size, self.grid_size)[:, column] = 0.0
         return values
 
 
@@ -310,12 +440,21 @@ def _render_transmission_map(
 ) -> tuple[np.ndarray, np.ndarray]:
     """渲染逐通道线性辐射图（超采样画布）与孔中心真值。
 
-    与荧光的关键差异：底色是**黑罩**（几乎不透光），孔内是
-    背照亮度 × 逐通道透射率。因此浓度越高，孔越暗。
+    统一模型：先渲染"背光穿过散射基底、再被反应区吸收"的亮场，
+    然后可选地乘上一层**遮罩**——孔内透过率 1.0，罩体透过率
+    mask_transmittance。这样三种情况是同一套公式的三个取值：
+
+        无罩            → 不乘遮罩层，亮基底 + 暗斑点（polarity=dark）
+        理想不透光黑罩  → T_mask≈0，黑底 + 亮孔（polarity=bright）
+        半透光 PDMS 罩  → T_mask 居中，对比度被压，且可能中途翻转极性
+
+    翻转发生在显色透射率降到罩体透过率以下时，即 A > −log10(T_mask)：
+    此时该孔比罩体还暗，同一张图里低浓度孔是亮点、高浓度孔是暗点，
+    而极性判定是**全局单一决策**，必然判错一半。
     """
 
     grid = config.grid_size
-    substrate_mode = config.layout != "mask"
+    masked = config.layout == "masked"
     scene = np.full((canvas, canvas, 3), config.outside_panel_level, dtype=np.float64)
 
     panel_side = canvas * config.panel_fill
@@ -323,9 +462,6 @@ def _render_transmission_map(
     panel_y0 = (canvas - panel_side) / 2.0
     px0, py0 = int(round(panel_x0)), int(round(panel_y0))
     px1, py1 = int(round(panel_x0 + panel_side)), int(round(panel_y0 + panel_side))
-    # substrate 形态下面板本体是亮的（背光穿过散射膜）；mask 形态下
-    # 面板本体是黑罩，只留极小漏光。
-    scene[py0:py1, px0:px1, :] = config.mask_leak
 
     # 背照场：EL 面板亮度分布，先在整幅画布上算好，再按孔采样。
     # 蜂窝纹是 EL 的固有像素结构，漫射膜只能压低不能消除；周期取 mm 再
@@ -349,17 +485,18 @@ def _render_transmission_map(
     pitch = usable / max(grid - 1, 1)
     half = max(1.0, pitch * config.well_fill / 2.0)
 
-    if substrate_mode:
-        # 亮基底：整片面板被背光穿透，亮度只受照明场和膜透射率调制。
-        # 反应区随后在其上做**减法**（额外吸收），因此斑点必然比基底暗。
-        scene[py0:py1, px0:px1, :] = (
-            field[py0:py1, px0:px1, None] * config.blank_level * config.substrate_transmittance
-        )
-        if config.substrate_texture > 0:
-            coarse = rng.normal(0.0, config.substrate_texture, (48, 48))
-            texture = cv2.resize(coarse, (px1 - px0, py1 - py0), interpolation=cv2.INTER_CUBIC)
-            scene[py0:py1, px0:px1, :] *= np.clip(1.0 + texture, 0.0, None)[:, :, None]
+    # 1) 亮基底：整片面板被背光穿透，亮度受照明场与膜透射率调制。
+    scene[py0:py1, px0:px1, :] = (
+        field[py0:py1, px0:px1, None] * config.blank_level * config.substrate_transmittance
+    )
+    if config.substrate_texture > 0:
+        coarse = rng.normal(0.0, config.substrate_texture, (48, 48))
+        texture = cv2.resize(coarse, (px1 - px0, py1 - py0), interpolation=cv2.INTER_CUBIC)
+        scene[py0:py1, px0:px1, :] *= np.clip(1.0 + texture, 0.0, None)[:, :, None]
 
+    # 2) 反应区吸收：在亮基底上做乘法，基底的梯度与纹理因此会透出来。
+    #    同时记录孔的覆盖掩膜，供第 3 步的遮罩层使用。
+    aperture = np.zeros((canvas, canvas), dtype=np.float64)
     centers = np.empty((grid * grid, 2), dtype=np.float64)
     for row in range(grid):
         for col in range(grid):
@@ -374,27 +511,25 @@ def _render_transmission_map(
             x1, y1 = min(x1, canvas), min(y1, canvas)
             if x1 <= x0 or y1 <= y0:
                 continue
-            if substrate_mode:
-                # 反应区落在已经亮着的基底上：就地乘以显色透射率。
-                # 用乘法而不是赋值，基底的照明梯度和纹理才会被保留下来。
-                for ch in range(3):
-                    scene[y0:y1, x0:x1, ch] *= float(transmittance[index, ch])
-                continue
 
-            # 黑罩形态：孔内亮度 = 该处背照 × 显色透射率。
-            local = float(field[y0:y1, x0:x1].mean()) * config.blank_level
             if config.well_shape == "circle":
                 patch = np.zeros((y1 - y0, x1 - x0), dtype=np.float64)
                 cv2.circle(patch, ((x1 - x0) // 2, (y1 - y0) // 2),
                            int(round(half)), 1.0, -1, lineType=cv2.LINE_AA)
-                for ch in range(3):
-                    value = local * float(transmittance[index, ch])
-                    scene[y0:y1, x0:x1, ch] = np.maximum(
-                        scene[y0:y1, x0:x1, ch], patch * value
-                    )
             else:
-                for ch in range(3):
-                    scene[y0:y1, x0:x1, ch] = local * float(transmittance[index, ch])
+                patch = np.ones((y1 - y0, x1 - x0), dtype=np.float64)
+            aperture[y0:y1, x0:x1] = np.maximum(aperture[y0:y1, x0:x1], patch)
+            for ch in range(3):
+                factor = 1.0 + patch * (float(transmittance[index, ch]) - 1.0)
+                scene[y0:y1, x0:x1, ch] *= factor
+
+    # 3) 遮罩层：孔内 1.0、罩体 mask_transmittance。理想黑罩把罩体压到近乎
+    #    全黑（于是变成"黑底亮孔"），半透光 PDMS 罩只是把它压暗一些。
+    if masked:
+        mask_layer = np.full((canvas, canvas), config.mask_transmittance, dtype=np.float64)
+        mask_layer[py0:py1, px0:px1] = config.mask_transmittance
+        mask_layer = mask_layer + aperture * (1.0 - config.mask_transmittance)
+        scene = scene * mask_layer[:, :, None]
 
     # 孔间串扰：黑罩出射锥半角 14°-27°，零间距贴合时锥脚会溢到邻孔。
     sigma = config.crosstalk_sigma_ratio * pitch
@@ -424,7 +559,20 @@ def render_colorimetric_scene(
     concentrations = config.resolved_concentrations()
     if force_blank:
         concentrations = np.zeros_like(concentrations)
-    transmittance = concentration_to_channel_transmittance(concentrations, config.chromophore)
+
+    plasmon_mode = config.signal_model == "plasmon"
+    if plasmon_mode:
+        transmittance, peak_shift = plasmon_channel_transmittance(concentrations, config.plasmon)
+    else:
+        transmittance = concentration_to_channel_transmittance(concentrations, config.chromophore)
+        peak_shift = None
+        if config.array_plasmon is not None:
+            # 金阵列的消光叠加在显色产物之上：光先穿金，再穿产物。
+            # 空白图里金的消光完全相同，故取比值时对消，不引入偏差。
+            gold, _ = plasmon_channel_transmittance(
+                np.zeros_like(concentrations), config.array_plasmon
+            )
+            transmittance = transmittance * gold
 
     scene, centers = _render_transmission_map(config, transmittance, canvas, rng)
 
@@ -466,6 +614,19 @@ def render_colorimetric_scene(
         "chromophore": asdict(config.chromophore),
         "config": asdict(config),
     }
+    if plasmon_mode:
+        # 等离激元路径的被测量是**峰移**，吸光度只是顺带保留的派生量。
+        # ratio 是实际读数：峰移改变通道相对强弱，比值即信号。
+        truth.update({
+            "signal_model": "plasmon",
+            "peak_shift_nm": [round(float(v), 6) for v in peak_shift],
+            "ratio_pair": config.ratio_pair,
+            "channel_ratio": [round(float(v), 8) for v in channel_ratio(transmittance, config.ratio_pair)],
+            "plasmon": asdict(config.plasmon),
+            "reference_column": config.reference_column,
+        })
+    else:
+        truth["signal_model"] = "dye"
     return image, truth
 
 
@@ -630,6 +791,140 @@ DIFFICULTY_PRESETS: dict[str, dict[str, object]] = {
 }
 
 
+def plasmon_readout_study(
+    plasmon: PlasmonResonance,
+    concentrations_uM: np.ndarray,
+    ratio_pair: str = "RG",
+    ratio_noise: float = 0.00198,
+) -> dict[str, object]:
+    """比值读数的分辨率与动态范围，纯光学、不含成像。
+
+    先回答"比色到底能不能替代光谱"，再决定要不要建完整图像仿真——
+    如果这一步就答不可行，图像仿真做得再细也没意义。
+
+    ratio_noise 默认 0.198%（满阱 12000e⁻、ROI≈450px、双点比值的 3σ
+    散粒噪声）。真实系统还要叠加漂移与配准误差，把它调大即可看到
+    结论如何退化。
+    """
+
+    channels, shift = plasmon_channel_transmittance(concentrations_uM, plasmon)
+    ratio = channel_ratio(channels, ratio_pair)
+    baseline = channel_ratio(
+        plasmon_channel_transmittance(np.array([0.0]), plasmon)[0], ratio_pair
+    )[0]
+    signal = ratio / baseline - 1.0
+
+    # 每 nm 峰移带来多少比值变化（在工作点附近取导数）
+    probe, _ = plasmon_channel_transmittance(np.array([0.0]), plasmon)
+    shifted = plasmon.transmittance_spectrum(np.array([1.0]))
+    weight = el_source_spectrum()[None, :] * camera_channel_response()
+    probe_shift = shifted @ weight.T / weight.sum(axis=1)[None, :]
+    per_nm = abs(channel_ratio(probe_shift, ratio_pair)[0] / baseline - 1.0)
+    resolvable_nm = ratio_noise / per_nm if per_nm > 0 else float("inf")
+
+    full_scale = float(np.max(np.abs(signal))) if signal.size else 0.0
+    return {
+        "ratio_pair": ratio_pair,
+        "baseline_ratio": round(float(baseline), 6),
+        "sensitivity_per_nm": round(float(per_nm), 8),
+        "resolvable_shift_nm": round(float(resolvable_nm), 4),
+        "shift_max_nm": plasmon.shift_max_nm,
+        # 可用档位数：满量程峰移能被分成几个可分辨的等级
+        "usable_levels": int(plasmon.shift_max_nm / resolvable_nm) if resolvable_nm > 0 else 0,
+        "full_scale_ratio_change": round(full_scale, 6),
+        "shift_nm": [round(float(v), 4) for v in shift],
+        "signal": [round(float(v), 8) for v in signal],
+    }
+
+
+def polarity_flip_absorbance(mask_transmittance: float) -> float:
+    """极性翻转发生的吸光度：A > −log10(T_mask) 的孔比罩体还暗。
+
+    这是"半透光罩为什么有害"的定量表述。理想黑罩 T=0.002 时翻转点是
+    A=2.7，远在量程之外；PDMS 罩 T=0.25 时只有 A=0.60，量程内就会翻。
+    """
+
+    return float(-math.log10(max(float(mask_transmittance), 1e-12)))
+
+
+def mask_transmittance_study(
+    base: ColorimetricConfig,
+    levels: tuple[float, ...] = (0.002, 0.01, 0.05, 0.10, 0.20, 0.30, 0.50, 1.0),
+    output_dir: str | Path | None = None,
+) -> list[dict[str, object]]:
+    """扫描罩体透过率，报告每一档的定位表现与**吸光度读数精度**。
+
+    回答的是一个硬件决策：**这批半透光的 PDMS 罩值不值得装**。
+
+    两项代价方向相反，必须一起看：
+    - 装罩的收益在**定位**。罩子给出硬边几何孔径，斑点再淡也有边缘可找；
+      不装罩时低浓度斑点在白膜上几乎没有对比度，检测器直接失明。
+    - 装罩的代价在**光度**。罩体漏的光经离焦与串扰渗进 ROI，等效于杂散光：
+      A = −log10((I+L)/(I_blank+L))，L 越大曲线被压得越平，高吸光端最先失真。
+
+    因此判据不是"罩子看起来黑不黑"，而是漏光把吸光度压偏多少。
+    """
+
+    rows: list[dict[str, object]] = []
+    concentrations = base.resolved_concentrations()
+    transmittance = concentration_to_channel_transmittance(concentrations, base.chromophore)
+    # 翻转判据必须按**亮度**算，不能挑某一个通道：极性检测走的是灰度图，
+    # 而显色产物的信号通道随染料而变（黄色吸蓝、蓝色吸红）。
+    luminance = transmittance @ np.array([0.299, 0.587, 0.114], dtype=np.float64)
+    absorbance = apparent_absorbance(luminance)
+
+    for level in levels:
+        bare = level >= 1.0
+        config = ColorimetricConfig(**{
+            **asdict_shallow(base),
+            "layout": "bare" if bare else "masked",
+            "mask_transmittance": float(level),
+        })
+        flip_A = polarity_flip_absorbance(level)
+        # 量程内有多少孔会翻到"比罩体还暗"
+        flipped = int((absorbance > flip_A).sum()) if not bare else 0
+
+        row: dict[str, object] = {
+            "mask_transmittance": float(level),
+            "layout": "bare" if bare else "masked",
+            "flip_absorbance": round(flip_A, 3) if not bare else None,
+            "wells_past_flip": flipped,
+            "well_count": int(concentrations.size),
+        }
+
+        if output_dir is not None:
+            out = Path(output_dir) / f"T{level:.3f}"
+            paths = write_colorimetric_sample(config, out, name="s")
+            report = evaluate_generated_sample(
+                paths["image"], paths["blank"], paths["image_truth"], out / "eval"
+            )
+            row.update({
+                "polarity": report["unit_polarity"],
+                "error_pct_pitch": report["mean_error_pct_pitch"],
+                "support": report["candidate_support_ratio"],
+                "trusted": report["trusted"],
+            })
+            channels = ((report.get("absorbance") or {}).get("per_channel") or {})
+            # 取真值吸光度最大的通道作为信号通道——它随染料而变。
+            signal = max(channels.items(), key=lambda kv: kv[1]["true_max"], default=(None, None))
+            if signal[0] is not None:
+                row.update({
+                    "signal_channel": signal[0],
+                    "absorbance_bias": signal[1]["bias"],
+                    "absorbance_rmse": signal[1]["rmse"],
+                    "absorbance_spearman": signal[1]["spearman"],
+                    "true_max_absorbance": signal[1]["true_max"],
+                })
+        rows.append(row)
+    return rows
+
+
+def asdict_shallow(config: ColorimetricConfig) -> dict[str, object]:
+    """浅拷贝配置字段（保留 Chromophore 对象本身，不展开成 dict）。"""
+
+    return {f: getattr(config, f) for f in config.__dataclass_fields__}
+
+
 def linearity_table(chromophore: Chromophore, concentrations_uM: np.ndarray) -> list[dict[str, float]]:
     """表观吸光度相对"过原点直线"的偏离，量化多色非线性的量程上界。"""
 
@@ -668,8 +963,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmax", type=float, default=800.0, help="最高浓度 µM")
     parser.add_argument("--blanks", type=int, default=8, help="空白孔数（浓度 0）")
     parser.add_argument("--path-mm", type=float, default=0.5, help="液层光程 mm")
-    parser.add_argument("--layout", default="substrate", choices=["substrate", "mask"],
-                        help="版面形态：substrate=亮基底暗斑点（实拍芯片），mask=黑罩亮孔")
+    parser.add_argument("--layout", default="bare", choices=["bare", "masked"],
+                        help="bare=不装黑罩（实拍芯片），masked=装黑罩")
+    parser.add_argument("--mask-transmittance", type=float, default=0.002,
+                        help="罩体透过率：黑 PMMA 约 0.002，PDMS 打印约 0.1-0.4")
+    parser.add_argument("--mask-study", action="store_true",
+                        help="扫描罩体透过率，给出'罩子要多不透光才有增益'的答案")
     parser.add_argument("--dye", default=None, choices=sorted(CHROMOPHORES),
                         help="显色产物预设；给了它就忽略 --peak-nm/--epsilon")
     parser.add_argument("--peak-nm", type=float, default=450.0, help="显色产物吸收峰 nm")
@@ -734,11 +1033,35 @@ def main() -> None:
             concentration_pattern=args.pattern,
             concentration_min_uM=args.cmin, concentration_max_uM=args.cmax,
             blank_well_count=args.blanks, chromophore=chromophore, seed=args.seed,
-            layout=args.layout,
+            layout=args.layout, mask_transmittance=args.mask_transmittance,
             jpeg_quality=None if args.png else 92,
         )
         base.update(overrides)
         return ColorimetricConfig(**base)
+
+    if args.mask_study:
+        config = build()
+        print(f"PG-Colori-Sim 黑罩透过率扫描（{args.grid}x{args.grid}，"
+              f"{args.cmin}–{args.cmax} µM，{chromophore.name}）")
+        print("问题：这批罩子值不值得装？判据是量程内会不会翻转极性、定位还站不站得住。\n")
+        rows = mask_transmittance_study(config, output_dir=output_dir)
+        print("定位看前半段（装罩给硬边孔径），光度看后半段（漏光等效杂散光压平曲线）。\n")
+        print(f"{'罩体透过率':>11s}{'形态':>8s}{'极性':>7s}{'定位%pitch':>12s}"
+              f"{'支撑率':>8s}{'可信':>7s}{'信号道':>8s}{'A偏差':>9s}{'A_RMSE':>9s}{'保序性':>9s}")
+        for row in rows:
+            print(f"{row['mask_transmittance']:>11.3f}{row['layout']:>8s}"
+                  f"{str(row.get('polarity','-')):>7s}"
+                  f"{row.get('error_pct_pitch', float('nan')):>12.2f}"
+                  f"{row.get('support', float('nan')):>8.3f}{str(row.get('trusted','-')):>7s}"
+                  f"{str(row.get('signal_channel','-')):>8s}"
+                  f"{row.get('absorbance_bias', float('nan')):>9.4f}"
+                  f"{row.get('absorbance_rmse', float('nan')):>9.4f}"
+                  f"{row.get('absorbance_spearman', float('nan')):>9.4f}")
+        truth_max = next((r.get("true_max_absorbance") for r in rows if r.get("true_max_absorbance")), None)
+        if truth_max:
+            print(f"\n真值吸光度上限 A={truth_max:.3f}；A偏差相对它的占比即漏光造成的系统性压缩。")
+        print(f"输出目录: {output_dir.resolve()}")
+        return
 
     if args.sweep:
         print(f"PG-Colori-Sim 难度扫描（{args.grid}x{args.grid}，"
