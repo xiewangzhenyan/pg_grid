@@ -249,25 +249,50 @@ F = Φ_eff · (1 − 10^(−A))    · 10^(−overlap·A)   ,  A = ε·c·l
     self-quench  primary IFE   secondary IFE (reabsorption)
 ```
 
-Measured on the default parameters (ε = 8×10⁴ M⁻¹cm⁻¹, Φ = 0.92, l = 3 mm):
+The turnover position is set by A = ε·c·l, so **the liquid layer depth decides
+how much of the range stays invertible**. The default is a 0.5 mm layer:
+
+| Path length | Turnover | 1 nM – 100 µM strictly monotonic? |
+|---|---|---|
+| 3.0 mm | 51.5 µM | no — sensitivity already degraded past 20 µM |
+| 1.0 mm | 151.5 µM | no |
+| **0.5 mm (default)** | **295.3 µM** | **yes** |
+| 0.2 mm | 690.1 µM | yes |
+
+Measured at the default (ε = 8×10⁴ M⁻¹cm⁻¹, Φ = 0.92, l = 0.5 mm):
 
 | Concentration | Emission relative to a straight line through the origin |
 |---|---|
-| 1 nM – 100 nM | 100.0% (linear) |
-| 1 µM | 97.0% |
-| 10 µM | 74.2% |
-| 51 µM | 28.6% — **peak; the curve turns over here** |
-| 100 µM | 12.8%, and *dimmer* than 51 µM |
+| 0.1 µM | 99.9% |
+| 1 µM | 99.5% |
+| 10 µM | 94.9% |
+| 50 µM | 77.6% |
+| 100 µM | 61.2% — compressed but still rising |
 
-That turnover is why the truth records absolute concentration rather than
-"percent of maximum". Past ~51 µM the same grey level corresponds to two
-different concentrations, and the position of that ambiguity is fixed in µM —
-a relative scale would slide it around with whatever `C_max` a consumer
-picked afterwards, and images with different ranges could not share one
-calibration curve. `--linear` disables both nonlinearities for an A/B control;
-it degenerates to the dilute-limit expansion so the two datasets coincide at
-low concentration and any difference is attributable to the nonlinearity
-itself.
+A thinner layer trades sensitivity for range: it absorbs less excitation, so
+the whole curve is weaker and the detection limit rises. Measured on the
+dataset command below, moving 3 mm → 0.5 mm pushed the turnover from 51 µM to
+295 µM but raised the LOD from 0.29 µM to 3.13 µM. Both are the same A, seen
+from two sides.
+
+That LOD is set by **substrate autofluorescence**, not by read noise, so
+longer exposure does not lower it — the background scales with exposure too.
+Reaching lower concentrations needs a cleaner substrate or a better emission
+filter.
+
+Recording absolute concentration rather than "percent of maximum" is what
+makes any of this expressible. Past the turnover the same grey level
+corresponds to two different concentrations, and the position of that
+ambiguity is fixed in µM — a relative scale would slide it around with
+whatever `C_max` a consumer picked afterwards, and images with different
+ranges could not share one calibration curve. `--linear` disables both
+nonlinearities for an A/B control; it degenerates to the dilute-limit
+expansion so the two datasets coincide at low concentration and any
+difference is attributable to the nonlinearity itself.
+
+Self-quenching is modelled but contributes under 1% below 100 µM (0.99% at
+100 µM) and cannot produce a turnover on its own — the curve with only
+self-quenching enabled is monotonic. The turnover is the inner filter effect.
 
 ### Generating a calibration dataset
 
@@ -300,12 +325,21 @@ Measured on that command (8 images, 15×15, requested 1 nM–100 µM):
 
 | | |
 |---|---|
-| Effective range after clamping | 0.110 – 100 µM |
+| Effective range after clamping | 0.470 – 100 µM |
 | Images passing localization | 8/8, 1800 pooled pairs |
-| Blank background | −0.02 ± 0.33 grey |
-| Detection limit (blank + 3σ) | 0.292 µM |
-| Monotonic upper bound | 38.9 µM (turnover detected) |
-| Rank fidelity over the usable range | 0.991 |
+| Blank background | −0.03 ± 0.32 grey |
+| Detection limit (blank + 3σ) | 3.13 µM |
+| Monotonic upper bound | 100 µM — no turnover in range |
+| Rank fidelity over the usable range | 0.987 |
+
+Per-preset yield at 15×15, 3 images each: `ideal` 3/3, `typical` 3/3, `hard`
+3/3, `extreme` 2/3, with 1.3–3.7 %pitch localization error on the passing
+images. At **10×10** the `ideal` preset fails systematically instead (candidate
+support 0.03–0.10): razor-sharp synthetic squares with almost no defocus are
+harder for the blob detector than realistically blurred ones. That is
+pre-existing pipeline behavior on synthetic input, not a property of the
+concentration model, but it is why the dataset tests exercise 10×10 with
+`typical`/`hard`.
 
 `plate_series` assigns one concentration per row (replicates within a row give
 the calibration curve its error bars) and **shuffles the row order**. Both

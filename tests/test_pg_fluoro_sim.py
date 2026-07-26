@@ -264,25 +264,40 @@ def test_bundled_fluo_failure_cases_never_fail_silently(tmp_path):
 def test_emission_is_non_monotonic_so_relative_labels_are_ambiguous():
     """浓度→强度在量程内非单调，这正是真值必须记绝对浓度的理由。
 
-    默认参数（荧光素钠、光程 3mm）下发射强度在 ~50 µM 处到达峰值后因内滤
-    效应回落，拐点两侧存在读数相同的两个浓度。若真值只记"占最大浓度的
-    百分比"，同一个百分比标签在不同 C_max 下对应的物理位置会漂移，标注
-    与图像里烘焙的非线性就对不上了。
+    发射强度到达峰值后因内滤效应回落，拐点两侧存在读数相同的两个浓度。
+    若真值只记"占最大浓度的百分比"，同一个百分比标签在不同 C_max 下对应
+    的物理位置会漂移，标注与图像里烘焙的非线性就对不上了。
+
+    拐点位置由 A = ε·c·l 决定，所以本测试分两段：模型必须能表达拐点
+    （物理事实），而默认的 0.5 mm 液层必须把它推到 1 nM–100 µM 之外
+    （实际可反演性）。液层加厚会把拐点拉进量程——一并断言，避免有人
+    改了 path_length_cm 却没意识到量程上半段已经不可反演。
     """
+    from dataclasses import replace
+
     from pg_fluoro_sim import Photophysics, concentration_to_emission
 
     physics = Photophysics()
-    concentration = np.logspace(-3, 2, 2000)
+    concentration = np.logspace(-3, 3.5, 4000)
     emission = concentration_to_emission(concentration, physics)
 
     peak = int(np.argmax(emission))
-    assert 0 < peak < len(concentration) - 1, "峰值必须落在量程内部（内滤拐点）"
+    assert 0 < peak < len(concentration) - 1, "模型必须能表达内滤拐点"
     assert emission[-1] < emission[peak], "越过拐点后强度必须回落"
 
     # 拐点左侧存在与量程上端读数相同的浓度：单凭读数无法区分二者。
     twin = int(np.argmin(np.abs(emission[:peak] - emission[-1])))
     assert concentration[twin] < concentration[peak] < concentration[-1]
     assert abs(emission[twin] - emission[-1]) / emission[-1] < 0.02
+
+    # 默认 0.5 mm 液层：1 nM–100 µM 全程严格单调，因而可反演。
+    working = np.logspace(-3, 2, 4000)
+    assert np.all(np.diff(concentration_to_emission(working, physics)) > 0)
+    assert concentration[peak] > 100.0
+
+    # 液层加厚到 3 mm，拐点前移进量程，上半段不再可反演。
+    thick = concentration_to_emission(working, replace(physics, path_length_cm=0.30))
+    assert np.any(np.diff(thick) < 0)
 
 
 def test_linear_mode_is_monotonic_and_continuous_with_nonlinear_at_dilute_limit():
@@ -395,15 +410,15 @@ def test_fixed_exposure_gain_keeps_concentrations_comparable_across_images():
 def test_summarize_calibration_pairs_finds_lod_and_inner_filter_turnover():
     """汇总必须同时定位检出下限与内滤拐点。
 
-    拐点（~50 µM）与量程上端（100 µM）同处一个十倍档内，因此不能靠档间
-    比较中位数发现它——本测试正是针对这一点。
+    拐点（默认 0.5 mm 液层下约 295 µM）与量程上端同处 [100,1000) 一个十倍
+    档内，因此不能靠档间比较中位数发现它——本测试正是针对这一点。
     """
     from pg_fluoro_sim import Photophysics, concentration_to_emission, summarize_calibration_pairs
 
     rng = np.random.default_rng(0)
     physics = Photophysics()
-    concentration = np.logspace(-4, 2, 600)
-    gray = concentration_to_emission(concentration, physics) * 200.0
+    concentration = np.logspace(-3, 3, 900)
+    gray = concentration_to_emission(concentration, physics) * 300.0
     gray = gray + rng.normal(0.0, 0.4, gray.size)
 
     rows = [{"concentration_uM": float(c), "measured_gray": float(g)}
@@ -413,10 +428,13 @@ def test_summarize_calibration_pairs_finds_lod_and_inner_filter_turnover():
 
     summary = summarize_calibration_pairs(rows)
     assert summary["detection_limit_uM"] is not None
-    # 本底 3σ 约 1.2 灰度，对应浓度在 0.01–1 µM 量级。
-    assert 0.001 <= summary["detection_limit_uM"] <= 1.0
+    # 检出下限必须显著低于拐点：可用区间要能跨至少一个半数量级，
+    # 否则"可反演"就成了空话。
+    assert 0.001 <= summary["detection_limit_uM"] <= 10.0
+    assert summary["monotonic_max_uM"] / summary["detection_limit_uM"] > 30.0
     assert summary["turnover_detected"] is True
-    assert 20.0 <= summary["monotonic_max_uM"] <= 80.0
+    # 理论拐点 295 µM；容差覆盖噪声与滑动中位数窗口的影响。
+    assert 150.0 <= summary["monotonic_max_uM"] <= 600.0
     assert summary["spearman_usable"] > 0.95
 
 
@@ -426,11 +444,13 @@ def test_build_concentration_dataset_pools_pairs_and_gates_on_localization(tmp_p
 
     from pg_fluoro_sim import build_concentration_dataset
 
-    # 1200px 是实测的下限：900px 时 10×10 的孔斑过小，候选支撑率跌到
-    # 0.01–0.27，多数图过不了定位校核（既有管线行为，与浓度改动无关）。
+    # 两个实测约束（均为既有管线行为，与浓度改动无关），故意用 10×10 这个
+    # 更严苛的规格：900px 时孔斑过小、支撑率跌到 0.01–0.27；ideal 预设在
+    # 10×10 上系统性失败（支撑 0.03–0.10，锐利合成方块反而难检出），而在
+    # 15×15 上四种预设都是 3/3。
     manifest = build_concentration_dataset(
         tmp_path, count=3, grid_size=10, concentration_pattern="plate_series",
-        difficulties=("ideal", "typical"), blank_wells=6,
+        difficulties=("typical", "hard"), blank_wells=6,
         base_overrides={"image_size": 1200},
     )
 
