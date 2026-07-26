@@ -14,6 +14,10 @@ No application-specific background is required to use or review this repository.
 - `pg_benchmark.py`: seeded synthetic perturbation benchmark (7 perturbation families) with degradation-curve reports and A/B comparison.
 - `pg_benchmark_demo.py`: command-line benchmark runner and report comparator.
 - `pg_fluoro_sim.py`: physically-modelled fluorescence array simulator with ground truth — generates emission images (wavelength→RGB, per-well intensities, optics, sensor noise) and evaluates the pipeline against the known truth. `--concentration` drives emission from **absolute fluorophore concentration** through an inner-filter/self-quenching model, and `--dataset N` pools the results into a calibration dataset.
+- `pg_colori_sim.py`: transmission (colorimetric) array simulator with ground
+  truth — white EL backlight through a black mask, per-wavelength Beer-Lambert
+  absorption, paired blank image, and `A = -log10(I/I_blank)` evaluation.
+  Shares the geometry/optics/sensor chain with `pg_fluoro_sim`.
 - `pg_unit_export.py`: per-unit tight cropping — exports every array unit as an
   individual background-free PNG with a manifest and a contact-sheet
   verification image.
@@ -492,6 +496,97 @@ below the quantization floor, many dead wells), but such runs must report
 `trusted=false`. This matters because the candidate-support ratio is blind to
 whole-lattice shifts by an integer pitch — a grid displaced by exactly one
 pitch still has 14/15 of its points sitting on real wells.
+
+## Colorimetric Simulation with Ground Truth
+
+`pg_colori_sim.py` is the transmission counterpart of the fluorescence
+simulator, matching the v4.2 hardware's colorimetric mode: a white EL panel
+backlights the chip through a black PMMA mask (15×15 square apertures, 0.5 mm
+on a 1.0 mm pitch), and the phone photographs the array from above.
+
+Geometrically this looks like the fluorescence case — bright wells on a dark
+field, so the pipeline still detects `polarity=bright`. Physically it is the
+inverse: wells get **darker** with concentration, and the measured quantity is
+`A = -log10(I_sample / I_blank)` rather than an emission level. Everything
+downstream of scene radiance — geometry, defocus, vignetting, sensor noise,
+quantization — is shared with `pg_fluoro_sim` through `apply_optics_and_sensor`
+so the two modes cannot drift apart in what they claim about noise or SNR.
+
+```powershell
+python pg_colori_sim.py --grid 15 --output sim/c15 --evaluate
+python pg_colori_sim.py --grid 15 --output sim/csweep --sweep
+python pg_colori_sim.py --output . --linearity
+```
+
+Absorbance is integrated per wavelength rather than given a scalar `ε` per
+channel, because **Beer-Lambert does not commute with spectral integration**:
+
+```
+I_ch = ∫ S(λ)·R_ch(λ)·10^(−ε(λ)·c·l) dλ
+```
+
+A camera channel is tens of nanometres wide, so at high concentration the
+integral is dominated by the wavelengths where `ε` is *smallest*, and apparent
+absorbance bends away from linearity. This is the colorimetric analogue of the
+fluorescence inner-filter turnover, and it sets the upper end of the working
+range. A scalar-`ε` model produces a perfectly straight line and hides it.
+
+Because both a blank and a sample are needed, `write_colorimetric_sample`
+always emits a paired blank image rendered from the same seed — the fixed
+pattern noise then cancels in the ratio, exactly as it does on real hardware.
+
+### The 0.5 mm liquid layer sets the working range
+
+The chip is 20×20×0.5 mm, so the optical path is 0.5 mm — 20× shorter than a
+standard cuvette and 6× shorter than a microplate well. With TMB's acid
+endpoint (ε ≈ 5.9×10⁴ M⁻¹cm⁻¹ at 450 nm), measured on the blue channel:
+
+| Target | Concentration needed |
+|---|---|
+| A = 0.1 (practical floor) | 47 µM |
+| A = 1.0 | 471 µM |
+| A = 2.0 | 943 µM |
+
+Polychromatic compression is already 5% at A ≈ 0.4 (200 µM) and 22% at
+A ≈ 1.2 (700 µM), so the usefully linear range is roughly **25–200 µM**, with
+250–700 µM usable only against a non-linear calibration curve. Sub-µM
+colorimetric detection is not reachable with this chip geometry; the
+fluorescence mode's ~3 µM LOD is the better route for low concentrations.
+Path length is the single most effective lever if colorimetric sensitivity
+needs to improve.
+
+Measured on `--sweep` at 15×15:
+
+| preset | localization | A_B Spearman | blank A_B | trusted |
+|---|---|---|---|---|
+| `ideal` | 1.27 %pitch | 0.9995 | 0.0003 ± 0.0012 | true |
+| `typical` | 1.34 %pitch | 0.9995 | 0.0000 ± 0.0014 | true |
+| `hard` | 215.01 %pitch | −0.12 | — | **true (wrong)** |
+| `extreme` | 236.46 %pitch | 0.57 | — | false |
+
+Channel selectivity behaves as it should: for the yellow product the blue
+channel reaches A = 1.34 while red only reaches 0.047, so the readout carries
+colour information rather than just brightness.
+
+### Colorimetry makes the whole-lattice shift blind spot worse
+
+The `hard` row above is a silent failure — the contract violation the fluo
+regression set exists to prevent. It is the same defect documented earlier: an
+exhaustive integer-offset search shows that shifting the fitted grid by
+(−2 rows, −1 column) collapses the error from 215.01 to **1.82 %pitch**, so the
+geometry is right and only the index assignment is wrong.
+
+What is new is that colorimetry removes the accidental protection fluorescence
+had. A dilution series leaves a third of its wells under the detection floor,
+which drags `candidate_support_ratio` down to ~0.55 and trips the 0.6 gate more
+or less by luck. In transmission every well is visible — the span is only about
+20:1 — so a displaced grid still lands on real wells and all three signals stay
+high: support 0.80, coverage 0.83, observed 0.87. The run is reported as
+trusted.
+
+This raises the priority of the evidence-based shift detector: without it, the
+colorimetric mode can return a confidently wrong grid, and unlike the
+fluorescence case nothing else catches it.
 
 ## Perturbation Benchmark and A/B Comparison
 
