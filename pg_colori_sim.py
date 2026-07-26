@@ -122,6 +122,91 @@ CHROMOPHORES: dict[str, Chromophore] = {
 }
 
 
+def _lorentz_band(peak_nm: float, fwhm_nm: float) -> np.ndarray:
+    """归一化到峰值 1.0 的洛伦兹带。等离激元共振是阻尼振子，尾巴比高斯重。"""
+
+    half = max(float(fwhm_nm), 1e-6) / 2.0
+    return 1.0 / (1.0 + ((LAMBDA_NM - float(peak_nm)) / half) ** 2)
+
+
+@dataclass
+class PlasmonResonance:
+    """金纳米结构阵列的局域表面等离激元共振带（无标记 LSPR 传感）。
+
+    与 Chromophore 的物理**完全不同**，不是同一个模型换参数：
+
+    - 显色剂：吸收带位置固定，浓度让它**加深**。读数是吸光度，A ∝ c。
+    - 等离激元：消光带深度基本固定，结合让它**移动**。读数必须是通道比值；
+      对峰移取 −log10(I/I₀) 会把位移和幅度揉进一个数，信息反而丢失。
+
+    剂量响应是抗原抗体亲和结合，服从 Langmuir 等温式而不是线性关系：
+
+        Δλ(c) = Δλ_max · c / (K_D + c)
+
+    只有 c ≪ K_D 时才近似线性。跨一个数量级以上仍用线性拟合，高浓度端
+    会系统性偏低，这是标定曲线最常见的一个错误。
+    """
+
+    name: str = "annealed Au island array"
+    peak_nm: float = 630.0            # 未结合时的共振峰位
+    fwhm_nm: float = 110.0            # 线宽
+    extinction_depth: float = 0.45    # 峰处消光深度 1 − T_min
+    shift_max_nm: float = 4.0         # 饱和结合时的峰移
+    kd_uM: float = 0.05               # 解离常数（决定动态范围位置）
+
+    def shift_for(self, concentrations_uM: np.ndarray) -> np.ndarray:
+        """Langmuir 结合 → 峰移 (nm)。"""
+
+        c = np.clip(np.asarray(concentrations_uM, dtype=np.float64), 0.0, None)
+        return self.shift_max_nm * c / (self.kd_uM + c)
+
+    def transmittance_spectrum(self, shift_nm: np.ndarray) -> np.ndarray:
+        """逐孔透射谱 T(λ)，形状 (N, len(LAMBDA_NM))。"""
+
+        shift = np.asarray(shift_nm, dtype=np.float64).reshape(-1, 1)
+        half = max(self.fwhm_nm, 1e-6) / 2.0
+        detune = (LAMBDA_NM[None, :] - (self.peak_nm + shift)) / half
+        return 1.0 - self.extinction_depth / (1.0 + detune ** 2)
+
+
+def plasmon_channel_transmittance(
+    concentrations_uM: np.ndarray,
+    plasmon: PlasmonResonance,
+    source: np.ndarray | None = None,
+    response: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """浓度 → (逐通道透射率 (N,3) RGB, 逐孔峰移 (N,))。
+
+    与显色剂路径的关键差异：c=0 时透射率**不是 1.0**——金阵列本身就有
+    消光。所以"空白"是"未结合的金阵列"，而不是"什么都没有"。
+    """
+
+    if source is None:
+        source = el_source_spectrum()
+    if response is None:
+        response = camera_channel_response()
+
+    shift = plasmon.shift_for(concentrations_uM)
+    spectra = plasmon.transmittance_spectrum(shift)      # (N, L)
+    weight = source[None, :] * response                  # (3, L)
+    channels = spectra @ weight.T / weight.sum(axis=1)[None, :]
+    return channels, shift
+
+
+def channel_ratio(transmittance: np.ndarray, pair: str = "RG") -> np.ndarray:
+    """通道比值读数。峰移改变通道间的相对强弱，比值即信号。
+
+    比值天然对消曝光、光源亮度、照明梯度这些共模量——它们同等地作用于
+    两个通道。这正是等离激元读数应当用比值而不是绝对值的原因。
+    """
+
+    index = {"R": 0, "G": 1, "B": 2}
+    t = np.asarray(transmittance, dtype=np.float64)
+    numerator = t[:, index[pair[0]]]
+    denominator = np.clip(t[:, index[pair[1]]], 1e-12, None)
+    return numerator / denominator
+
+
 def el_source_spectrum(blue_peak_nm: float = 490.0, blue_fwhm_nm: float = 70.0,
                        amber_peak_nm: float = 590.0, amber_fwhm_nm: float = 90.0,
                        amber_ratio: float = 0.75) -> np.ndarray:
@@ -231,6 +316,22 @@ class ColorimetricConfig:
     blank_well_count: int = 8         # 浓度恰为 0 的空白孔，标定必需
     chromophore: Chromophore = field(default_factory=Chromophore)
 
+    # 信号模型。两者物理不同，不是同一模型换参数：
+    # - "dye"：显色剂，吸收带固定、浓度让它加深，读吸光度。
+    # - "plasmon"：无标记 LSPR，共振峰随结合而移动，读通道比值。
+    #   金纳米阵列芯片属于后者——空白不是"透明"，而是"未结合的金阵列"。
+    signal_model: str = "dye"         # dye | plasmon
+    plasmon: PlasmonResonance = field(default_factory=PlasmonResonance)
+    ratio_pair: str = "RG"            # 比值读数用哪两个通道
+
+    # 参考列：该列只通缓冲液、不加抗原，作为同帧空间参考。
+    # 交叉通道版型（横向加抗体、纵向加抗原）让这件事几乎免费——牺牲
+    # 15/225 = 6.7% 通量，换来照明漂移、曝光波动、温度、行间基线差异
+    # 的共模对消，而且参考点与样品点在**同一帧**里。
+    # 时序参考（加抗原前后各拍一张）要跨越孵育、清洗、重新装夹，
+    # 中间的漂移往往比 1-5 nm 的信号还大。
+    reference_column: int | None = None
+
     # --- 曝光 ---
     blank_level: float = 0.85         # 空白孔的满阱分数；留 15% 余量防饱和
 
@@ -300,6 +401,11 @@ class ColorimetricConfig:
         if self.blank_well_count > 0:
             blanks = rng.choice(count, size=min(self.blank_well_count, count), replace=False)
             values[blanks] = 0.0
+
+        if self.reference_column is not None:
+            # 参考列只通缓冲液：整列浓度置零，且不受移液抖动影响。
+            column = int(self.reference_column) % self.grid_size
+            values.reshape(self.grid_size, self.grid_size)[:, column] = 0.0
         return values
 
 
@@ -433,7 +539,13 @@ def render_colorimetric_scene(
     concentrations = config.resolved_concentrations()
     if force_blank:
         concentrations = np.zeros_like(concentrations)
-    transmittance = concentration_to_channel_transmittance(concentrations, config.chromophore)
+
+    plasmon_mode = config.signal_model == "plasmon"
+    if plasmon_mode:
+        transmittance, peak_shift = plasmon_channel_transmittance(concentrations, config.plasmon)
+    else:
+        transmittance = concentration_to_channel_transmittance(concentrations, config.chromophore)
+        peak_shift = None
 
     scene, centers = _render_transmission_map(config, transmittance, canvas, rng)
 
@@ -475,6 +587,19 @@ def render_colorimetric_scene(
         "chromophore": asdict(config.chromophore),
         "config": asdict(config),
     }
+    if plasmon_mode:
+        # 等离激元路径的被测量是**峰移**，吸光度只是顺带保留的派生量。
+        # ratio 是实际读数：峰移改变通道相对强弱，比值即信号。
+        truth.update({
+            "signal_model": "plasmon",
+            "peak_shift_nm": [round(float(v), 6) for v in peak_shift],
+            "ratio_pair": config.ratio_pair,
+            "channel_ratio": [round(float(v), 8) for v in channel_ratio(transmittance, config.ratio_pair)],
+            "plasmon": asdict(config.plasmon),
+            "reference_column": config.reference_column,
+        })
+    else:
+        truth["signal_model"] = "dye"
     return image, truth
 
 
@@ -637,6 +762,52 @@ DIFFICULTY_PRESETS: dict[str, dict[str, object]] = {
                     illumination_nonuniformity=0.55, el_honeycomb=0.16, rotation_deg=8.0,
                     perspective_strength=0.055, radial_k1=-0.13, jpeg_quality=70),
 }
+
+
+def plasmon_readout_study(
+    plasmon: PlasmonResonance,
+    concentrations_uM: np.ndarray,
+    ratio_pair: str = "RG",
+    ratio_noise: float = 0.00198,
+) -> dict[str, object]:
+    """比值读数的分辨率与动态范围，纯光学、不含成像。
+
+    先回答"比色到底能不能替代光谱"，再决定要不要建完整图像仿真——
+    如果这一步就答不可行，图像仿真做得再细也没意义。
+
+    ratio_noise 默认 0.198%（满阱 12000e⁻、ROI≈450px、双点比值的 3σ
+    散粒噪声）。真实系统还要叠加漂移与配准误差，把它调大即可看到
+    结论如何退化。
+    """
+
+    channels, shift = plasmon_channel_transmittance(concentrations_uM, plasmon)
+    ratio = channel_ratio(channels, ratio_pair)
+    baseline = channel_ratio(
+        plasmon_channel_transmittance(np.array([0.0]), plasmon)[0], ratio_pair
+    )[0]
+    signal = ratio / baseline - 1.0
+
+    # 每 nm 峰移带来多少比值变化（在工作点附近取导数）
+    probe, _ = plasmon_channel_transmittance(np.array([0.0]), plasmon)
+    shifted = plasmon.transmittance_spectrum(np.array([1.0]))
+    weight = el_source_spectrum()[None, :] * camera_channel_response()
+    probe_shift = shifted @ weight.T / weight.sum(axis=1)[None, :]
+    per_nm = abs(channel_ratio(probe_shift, ratio_pair)[0] / baseline - 1.0)
+    resolvable_nm = ratio_noise / per_nm if per_nm > 0 else float("inf")
+
+    full_scale = float(np.max(np.abs(signal))) if signal.size else 0.0
+    return {
+        "ratio_pair": ratio_pair,
+        "baseline_ratio": round(float(baseline), 6),
+        "sensitivity_per_nm": round(float(per_nm), 8),
+        "resolvable_shift_nm": round(float(resolvable_nm), 4),
+        "shift_max_nm": plasmon.shift_max_nm,
+        # 可用档位数：满量程峰移能被分成几个可分辨的等级
+        "usable_levels": int(plasmon.shift_max_nm / resolvable_nm) if resolvable_nm > 0 else 0,
+        "full_scale_ratio_change": round(full_scale, 6),
+        "shift_nm": [round(float(v), 4) for v in shift],
+        "signal": [round(float(v), 8) for v in signal],
+    }
 
 
 def polarity_flip_absorbance(mask_transmittance: float) -> float:

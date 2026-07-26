@@ -221,3 +221,110 @@ def test_polarity_flip_absorbance_matches_mask_transmittance():
     assert abs(polarity_flip_absorbance(0.1) - 1.0) < 1e-9
     # 越透光越早翻转
     assert polarity_flip_absorbance(0.3) < polarity_flip_absorbance(0.05)
+
+
+def test_plasmon_shift_is_langmuir_not_linear():
+    """结合响应必须是 Langmuir 饱和，不是线性。
+
+    专利用线性拟合标准曲线，只在 c ≪ K_D 时成立；跨一个数量级以上
+    线性拟合会在高浓度端系统性偏低。
+    """
+    from pg_colori_sim import PlasmonResonance
+
+    p = PlasmonResonance(shift_max_nm=4.0, kd_uM=0.05)
+    c = np.array([0.0, 0.005, 0.05, 0.5, 5.0, 50.0])
+    shift = p.shift_for(c)
+
+    assert shift[0] == 0.0
+    # K_D 处恰好半饱和
+    assert abs(shift[2] - 2.0) < 1e-9
+    # 单调递增且饱和到 shift_max
+    assert np.all(np.diff(shift) > 0)
+    assert shift[-1] < p.shift_max_nm
+    assert shift[-1] > p.shift_max_nm * 0.99
+    # 明确非线性：浓度涨 10 倍，高浓度端峰移涨幅远小于 10 倍
+    assert (shift[4] / shift[3]) < 1.15
+
+
+def test_plasmon_blank_is_not_transparent():
+    """等离激元空白是"未结合的金阵列"，透射率显著小于 1。
+
+    这是与显色剂路径的根本差异：显色剂 c=0 时 T=1（透明），
+    金阵列 c=0 时仍有消光。把它当成显色剂建模会得到错误的基线。
+    """
+    from pg_colori_sim import PlasmonResonance, plasmon_channel_transmittance
+
+    p = PlasmonResonance(peak_nm=630.0, extinction_depth=0.45)
+    channels, shift = plasmon_channel_transmittance(np.array([0.0]), p)
+
+    assert shift[0] == 0.0
+    assert np.all(channels < 0.999), "空白透射率不应接近 1"
+    # 峰落在红端，故 R 通道衰减应强于 B
+    assert channels[0, 0] < channels[0, 2]
+
+
+def test_channel_ratio_cancels_common_mode():
+    """通道比值必须对消曝光/光源亮度这类共模缩放。"""
+    from pg_colori_sim import channel_ratio
+
+    t = np.array([[0.6, 0.8, 0.9], [0.5, 0.85, 0.92]])
+    base = channel_ratio(t, "RG")
+    scaled = channel_ratio(t * 0.37, "RG")      # 曝光减少到 37%
+    assert np.allclose(base, scaled), "比值未能对消共模缩放"
+
+
+def test_plasmon_readout_favours_shorter_peak_and_deeper_band():
+    """灵敏度排序：深度 > 峰位 ≫ 线宽。
+
+    线宽在**固定深度**下几乎不起作用——它之所以在真实器件上重要，
+    是因为等振子强度下变窄即变深，即通过深度间接起作用。
+    """
+    from pg_colori_sim import PlasmonResonance, plasmon_readout_study
+
+    def sens(peak, fwhm, depth):
+        p = PlasmonResonance(peak_nm=peak, fwhm_nm=fwhm, extinction_depth=depth)
+        return plasmon_readout_study(p, np.array([0.0]))["sensitivity_per_nm"]
+
+    # 峰位 630 → 560 显著提升
+    assert sens(560, 110, 0.45) > sens(630, 110, 0.45) * 2.5
+    # 深度提升同样显著
+    assert sens(560, 110, 0.65) > sens(560, 110, 0.25) * 2.5
+    # 固定深度下线宽影响很小
+    narrow, wide = sens(560, 80, 0.45), sens(560, 110, 0.45)
+    assert abs(narrow / wide - 1.0) < 0.15
+
+
+def test_reference_column_is_zero_concentration():
+    """参考列必须整列为零浓度，且不受移液抖动影响。"""
+    from pg_colori_sim import ColorimetricConfig
+
+    config = ColorimetricConfig(grid_size=15, reference_column=3,
+                                blank_well_count=0, concentration_jitter=0.2, seed=6)
+    values = config.resolved_concentrations().reshape(15, 15)
+
+    assert np.all(values[:, 3] == 0.0), "参考列存在非零浓度"
+    other = np.delete(values, 3, axis=1)
+    assert np.count_nonzero(other) > other.size * 0.9, "非参考列不应大面积为零"
+
+
+def test_plasmon_scene_renders_and_carries_shift_truth(tmp_path):
+    """等离激元模式必须渲染成图，并在真值里给出峰移与比值读数。"""
+    from pg_colori_sim import ColorimetricConfig, PlasmonResonance, render_colorimetric_scene
+
+    config = ColorimetricConfig(
+        grid_size=15, image_size=600, seed=9, layout="bare",
+        signal_model="plasmon", plasmon=PlasmonResonance(),
+        concentration_pattern="log_series", concentration_min_uM=0.001,
+        concentration_max_uM=1.0, reference_column=0, blank_well_count=0,
+    )
+    image, truth = render_colorimetric_scene(config)
+
+    assert image.shape == (600, 600, 3)
+    assert truth["signal_model"] == "plasmon"
+    assert len(truth["peak_shift_nm"]) == 225
+    assert len(truth["channel_ratio"]) == 225
+    assert truth["reference_column"] == 0
+
+    shift = np.asarray(truth["peak_shift_nm"]).reshape(15, 15)
+    assert np.all(shift[:, 0] == 0.0), "参考列峰移应为零"
+    assert shift.max() > 0.0
