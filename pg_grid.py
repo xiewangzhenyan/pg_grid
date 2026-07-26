@@ -654,27 +654,31 @@ def _find_axis_centers(projection: np.ndarray, count: int, length: int, margin_r
     return centers
 
 
-# 亮点检测器的几何门限系数，按**单元间距**（pitch）归一化。
-#
-# 为什么不能按画幅边长归一化：单元的像素尺寸正比于间距
-# pitch = side / grid_size，而不是正比于 side 本身。历史公式
-# （min_box=side*0.006、max_area=side²*0.0011 等）是在 15x15 上调出来的，
-# 因而隐含了 grid_size≈15 的假设。_default_rectified_size 给 10x10 用 800、
-# 给 15x15 用 1200，两者间距同为 80px、单元同为约 34px，但按边长算出的
-# max_area 却是 704 与 1584——同样大的单元在 10x10 被判超限。实测（真值
-# 矫正图、四个难度档）10x10 的 100 个孔只剩 19-24 个候选，且被拒的正是
-# 最亮最可靠的那些（超限的是大斑点）；15x15 则有 94-98 个。候选饥饿会
-# 一路传导为晶格拟合失败、支撑率 0、区域仲裁失去区分度。
-#
-# 下列系数是把**当前 15x15 档的门限**（side=1200、pitch=80）换算到 pitch
-# 单位：int(80*0.0875)=7、int(80*0.675)=54、int(6400*0.009)=57、
-# int(6400*0.2475)=1584、max(25,int(80*0.75))|1=61，与历史值逐值相同。
-# 因此 15x15 的行为按构造不变，10x10 则继承同一套已验证的几何门限。
-_BRIGHT_GATE_MIN_BOX = 0.0875
-_BRIGHT_GATE_MAX_BOX = 0.6750
-_BRIGHT_GATE_MIN_AREA = 0.0090
-_BRIGHT_GATE_MAX_AREA = 0.2475
-_BRIGHT_GATE_KERNEL = 0.7500
+# 斑点几何门限的参考规格：历史系数都是在 15x15 上调出来的。
+_GATE_REFERENCE_GRID = 15
+
+
+def _gate_reference_side(side: float, grid_size: int | None) -> float:
+    """把画幅边长换算成"等效 15x15 边长"，供几何门限沿用历史系数。
+
+    为什么按边长归一化是错的：单元的像素尺寸正比于**单元间距**
+    pitch = side*(1-2*margin)/(grid_size-1)，而不是正比于 side 本身。
+    历史公式（min_box=side*0.006、max_area=side²*0.0011 等）在 15x15 上
+    标定，因而隐含了 grid_size≈15 的假设。_default_rectified_size 给
+    10x10 用 800、给 15x15 用 1200，两者的单元同为约 34px，但按边长算出的
+    max_area 却是 704 与 1584——同样大的单元在 10x10 被判超限。实测（真值
+    矫正图、四个难度档）10x10 的 100 个孔只剩 19-24 个候选，且被拒的正是
+    最亮最可靠的那些（大斑点才会超上限）；15x15 则有 94-98 个。候选饥饿
+    会一路传导为晶格拟合失败、支撑率 0、区域仲裁失去区分度。
+
+    换算只需按 (grid-1) 反比缩放，因为 margin 与 side 都已在比值中约掉。
+    grid_size 为参考规格时返回 side 本身，故 15x15 的门限**逐值不变**，
+    这一恒等性由构造保证，而不依赖取整的巧合。
+    """
+
+    if not grid_size or grid_size < 2:
+        return float(side)
+    return float(side) * (_GATE_REFERENCE_GRID - 1) / float(grid_size - 1)
 
 
 def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | None = None) -> np.ndarray:
@@ -749,8 +753,8 @@ def _detect_bright_dot_candidates(
     抑制面板亮度本身和大面积光照渐变，再用连通域几何过滤剔除
     面板边缘亮带、高光条等非点状结构。
 
-    几何门限按**单元间距**归一化（见 _BRIGHT_GATE_*）。传入 grid_size
-    才能算出间距；不传时沿用按边长归一化的历史公式，保持旧调用点行为不变。
+    几何门限按**单元间距**归一化（见 _gate_reference_side）。传入 grid_size
+    才能做换算；不传时退化为按边长归一化的历史公式，旧调用点行为不变。
 
     返回 N×3 数组：[x, y, weight]，weight 表示候选亮点的响应强度。
     """
@@ -758,22 +762,16 @@ def _detect_bright_dot_candidates(
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
     side = float(scale_side) if scale_side else min(width, height)
+    # 换算到等效 15x15 边长后，历史系数原样沿用。
+    gate_side = _gate_reference_side(side, grid_size)
 
-    if grid_size:
-        # 单元的像素尺寸正比于**间距**，与画幅边长无关。
-        pitch = side / float(grid_size)
-        kernel_size = max(25, int(pitch * _BRIGHT_GATE_KERNEL))
-        min_box = max(5, int(pitch * _BRIGHT_GATE_MIN_BOX))
-        max_box = max(16, int(pitch * _BRIGHT_GATE_MAX_BOX))
-        min_area = max(20, int(pitch * pitch * _BRIGHT_GATE_MIN_AREA))
-        max_area = max(240, int(pitch * pitch * _BRIGHT_GATE_MAX_AREA))
-    else:
-        # 历史公式：按边长归一化（隐含 grid_size≈15，见 _BRIGHT_GATE_* 注释）。
-        kernel_size = max(25, int(side * 0.050))
-        min_box = max(5, int(side * 0.006))
-        max_box = max(16, int(side * 0.045))
-        min_area = max(20, int(side * side * 0.00004))
-        max_area = max(240, int(side * side * 0.00110))
+    kernel_size = max(25, int(gate_side * 0.050))
+    min_box = max(5, int(gate_side * 0.006))
+    # max_box 必须严格小于一个间距：它——而不是 max_area——才是挡住
+    # "两个相邻单元糊成一片"的那道门。
+    max_box = max(16, int(gate_side * 0.045))
+    min_area = max(20, int(gate_side * gate_side * 0.00004))
+    max_area = max(240, int(gate_side * gate_side * 0.00110))
 
     # 核尺寸要大于亮点直径，顶帽变换才会保留整个亮点而不是只留边缘。
     if kernel_size % 2 == 0:
@@ -899,6 +897,41 @@ def _cluster_axis_candidates(values: np.ndarray, weights: np.ndarray, length: in
     return clusters
 
 
+def _expected_axis_pitch(length: float, count: int, margin_ratio: float = 0.085) -> float:
+    """轴向的名义单元间距，与 generate_grid_points 的排布约定一致。"""
+
+    return float(length) * (1.0 - 2.0 * float(margin_ratio)) / max(count - 1, 1)
+
+
+# 轴间距接受区间：历史值 [length*0.045, length*0.095] 换算成"相对名义
+# 间距的倍率"。在参考规格 15x15 上按构造逐值不变（expected 的 length 与
+# margin 因子恰好被约掉），其余规格继承同一套倍率。
+_AXIS_PITCH_MIN_RATIO = 0.045 * (_GATE_REFERENCE_GRID - 1) / (1.0 - 2.0 * 0.085)
+_AXIS_PITCH_MAX_RATIO = 0.095 * (_GATE_REFERENCE_GRID - 1) / (1.0 - 2.0 * 0.085)
+
+
+def _axis_pitch_bounds(length: float, count: int) -> tuple[float, float]:
+    """轴间距的接受区间，按**行列数**而不是画幅边长定义。
+
+    历史写法 [length*0.045, length*0.095] 与斑点门限犯的是同一个错误：
+    间距正比于 length/(count-1)，按 length 定区间就隐含了 count≈15。
+    实测 grid=10、length=800 时上界 76 相对名义间距 73.8 只剩 3% 余量，
+    而 grid=15 有 60%；主区域框稍一外扩，grid=10 的轴拟合就整体被拒、
+    退化到均分网格。
+
+    区间**不能**改成围绕名义间距对称：下界是防"压缩/互补晶格"的那道门，
+    而不是可有可无的余量。实测把 grid=15 的下界从 54 放到 44 后，
+    examples/fluo/gradient_failure_0034 立刻拟合出间距 44.4 的压缩晶格，
+    定位错 99.9%pitch 却因为压缩晶格照样落在真实孔上而拿到 0.91 支撑率、
+    被判 trusted=True——正是"绝不静默失败"契约要拦的情形。
+    因此这里沿用 15x15 已验证的非对称倍率：下界收紧防压缩，上界留出
+    区域框外扩的余量。
+    """
+
+    expected = _expected_axis_pitch(length, count)
+    return expected * _AXIS_PITCH_MIN_RATIO, expected * _AXIS_PITCH_MAX_RATIO
+
+
 def _fit_line_slope_intercept(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     """一次多项式（直线）的闭式最小二乘解，等价于 np.polyfit(x, y, deg=1)。
 
@@ -961,7 +994,8 @@ def _complete_axis_with_missing_clusters(
         ratio = pitch_estimate / pitch_prior
         if round(ratio) >= 1 and abs(ratio - round(ratio)) < 0.18:
             pitch_estimate = float(pitch_prior)
-    if not length * 0.045 <= pitch_estimate <= length * 0.095:
+    axis_min_pitch, axis_max_pitch = _axis_pitch_bounds(length, count)
+    if not axis_min_pitch <= pitch_estimate <= axis_max_pitch:
         return None
 
     # 间距跳变 -> 索引跳跃（中间缺口）；累计得到相对索引。
@@ -975,7 +1009,7 @@ def _complete_axis_with_missing_clusters(
 
     best: tuple[float, np.ndarray] | None = None
     index_axis = np.arange(count, dtype=np.float64)
-    min_pitch, max_pitch = length * 0.045, length * 0.095
+    min_pitch, max_pitch = axis_min_pitch, axis_max_pitch
     min_start, max_start, max_end = length * 0.050, length * 0.300, length * 0.950
 
     for shift in range(count - span):
@@ -1034,8 +1068,7 @@ def _select_regular_axis_from_clusters(
 
     best: tuple[float, np.ndarray] | None = None
     index_axis = np.arange(count, dtype=np.float32)
-    min_pitch = length * 0.045
-    max_pitch = length * 0.095
+    min_pitch, max_pitch = _axis_pitch_bounds(length, count)
     # 起止范围只做弱约束（距边缘至少 5%）：主区域检测的外扩比例和形态学
     # 膨胀会让阵列在矫正图中的位置有 ±3% 左右浮动，过紧的范围会把
     # 合法网格误拒并退化为均分网格。假峰主要靠下面的规则性残差

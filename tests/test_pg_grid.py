@@ -1264,3 +1264,32 @@ def test_axis_completion_uses_other_axis_pitch_as_prior():
     assert with_prior is not None
     expected = start + pitch * np.arange(count)
     assert float(np.abs(with_prior - expected).max()) < 3.0
+
+
+def test_axis_pitch_bounds_are_count_normalised_and_guard_compressed_lattices():
+    """轴间距区间必须按行列数归一化，且下界不能放宽。
+
+    历史写法 [length*0.045, length*0.095] 隐含 count≈15：grid=10 时上界
+    76 相对名义间距 73.8 只剩 3% 余量，区域框稍一外扩轴拟合就整体被拒。
+    但区间不能改成围绕名义间距对称——下界是防"压缩/互补晶格"的门。实测
+    把 grid=15 下界从 54 放到 44 后，examples/fluo/gradient_failure_0034
+    拟合出间距 44.4 的压缩晶格，错 99.9%pitch 却拿到 0.91 支撑率并被判
+    可信，正是"绝不静默失败"契约要拦的情形。
+    """
+    from pg_grid import _axis_pitch_bounds, _expected_axis_pitch
+
+    # 参考规格 15x15 上按构造逐值等于历史值。
+    low, high = _axis_pitch_bounds(1200, 15)
+    assert abs(low - 1200 * 0.045) < 1e-6
+    assert abs(high - 1200 * 0.095) < 1e-6
+
+    # 其余规格继承同一套相对倍率，余量不再随规格漂移。
+    for length, count in [(800, 10), (1200, 15)]:
+        low, high = _axis_pitch_bounds(length, count)
+        expected = _expected_axis_pitch(length, count)
+        assert abs(high / expected - 1.602) < 0.01, f"{count}: 上余量偏离参考规格"
+        assert abs(low / expected - 0.759) < 0.01, f"{count}: 下界偏离参考规格"
+
+    # 压缩晶格（约 0.6 倍名义间距）必须落在区间外。
+    low, _ = _axis_pitch_bounds(1200, 15)
+    assert low > _expected_axis_pitch(1200, 15) * 0.62
