@@ -468,43 +468,23 @@ def _render_emission_map(config: FluorescenceConfig, intensities: np.ndarray,
     return scene, centers
 
 
-def render_fluorescence_scene(config: FluorescenceConfig) -> tuple[np.ndarray, dict[str, object]]:
-    """渲染一张荧光仿真图，返回 (BGR uint8 图像, 真值字典)。"""
+def apply_optics_and_sensor(
+    stack: np.ndarray,
+    config: object,
+    rng: np.random.Generator,
+    size: int,
+) -> np.ndarray:
+    """光学后段 + 传感器成像链：横差 → 离焦 → 渐晕 → 电子 → 噪声 → 8bit。
 
-    rng = np.random.default_rng(config.seed)
-    size = int(config.image_size)
-    scale = max(1, int(config.supersample))
-    canvas = size * scale
+    这一段只依赖"落到镜头上的线性辐射图"，与该辐射**如何产生**无关，
+    因此自发光（荧光）与背光透射（比色）共用同一实现——两个仿真器各写
+    一份传感器模型的话，噪声、满阱、量化的口径迟早会各自漂移，届时两种
+    模式测出的检出限就不再可比。
 
-    concentrations = config.resolved_concentrations()
-    intensities = config.resolved_intensities()
-    scene, centers = _render_emission_map(config, intensities, canvas, rng)
-
-    # --- 几何：旋转 + 透视 ---
-    matrix = _geometric_matrix(canvas, config.rotation_deg, config.perspective_strength, rng)
-    scene = cv2.warpPerspective(scene, matrix, (canvas, canvas), flags=cv2.INTER_LINEAR, borderValue=0.0)
-    centers = cv2.perspectiveTransform(
-        centers.reshape(-1, 1, 2).astype(np.float32), matrix.astype(np.float32)
-    ).reshape(-1, 2).astype(np.float64)
-
-    # --- 几何：径向畸变 ---
-    norm_r = canvas / 2.0
-    center_pt = np.array([canvas / 2.0, canvas / 2.0], dtype=np.float64)
-    scene = _radial_distort_image(scene, config.radial_k1, norm_r)
-    centers = _radial_distort_points(centers, center_pt, config.radial_k1, norm_r)
-
-    # --- 降采样到目标分辨率（抗锯齿，保证亚像素中心精度）---
-    if scale > 1:
-        scene = cv2.resize(scene, (size, size), interpolation=cv2.INTER_AREA)
-        centers = centers / scale
-
-    # --- 光谱：单色发射映射到 RGB 通道 ---
-    r_gain, g_gain, b_gain = wavelength_to_rgb(config.emission_nm)
-    bleed = config.spectral_bleed
-    gains = np.array([b_gain, g_gain, r_gain], dtype=np.float64)  # OpenCV BGR 顺序
-    gains = gains * (1.0 - bleed) + bleed * gains.mean()
-    gains = np.clip(gains, 0.0, None)
-    stack = scene[:, :, None] * gains[None, None, :]
+    config 需提供 chromatic_aberration_px / defocus_sigma_px / vignetting /
+    full_well_e / prnu / dark_current_e / read_noise_e / hot_pixel_ratio /
+    gamma / seed 字段。rng 由调用方传入以保持随机序列的调用顺序。
+    """
 
     # --- 横向色差：通道间轻微缩放差 ---
     if config.chromatic_aberration_px > 0:
@@ -556,7 +536,48 @@ def render_fluorescence_scene(config: FluorescenceConfig) -> tuple[np.ndarray, d
     normalized = np.clip(noisy / config.full_well_e, 0.0, 1.0)
     if abs(config.gamma - 1.0) > 1e-6:
         normalized = normalized ** (1.0 / config.gamma)
-    image = np.clip(normalized * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return np.clip(normalized * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def render_fluorescence_scene(config: FluorescenceConfig) -> tuple[np.ndarray, dict[str, object]]:
+    """渲染一张荧光仿真图，返回 (BGR uint8 图像, 真值字典)。"""
+
+    rng = np.random.default_rng(config.seed)
+    size = int(config.image_size)
+    scale = max(1, int(config.supersample))
+    canvas = size * scale
+
+    concentrations = config.resolved_concentrations()
+    intensities = config.resolved_intensities()
+    scene, centers = _render_emission_map(config, intensities, canvas, rng)
+
+    # --- 几何：旋转 + 透视 ---
+    matrix = _geometric_matrix(canvas, config.rotation_deg, config.perspective_strength, rng)
+    scene = cv2.warpPerspective(scene, matrix, (canvas, canvas), flags=cv2.INTER_LINEAR, borderValue=0.0)
+    centers = cv2.perspectiveTransform(
+        centers.reshape(-1, 1, 2).astype(np.float32), matrix.astype(np.float32)
+    ).reshape(-1, 2).astype(np.float64)
+
+    # --- 几何：径向畸变 ---
+    norm_r = canvas / 2.0
+    center_pt = np.array([canvas / 2.0, canvas / 2.0], dtype=np.float64)
+    scene = _radial_distort_image(scene, config.radial_k1, norm_r)
+    centers = _radial_distort_points(centers, center_pt, config.radial_k1, norm_r)
+
+    # --- 降采样到目标分辨率（抗锯齿，保证亚像素中心精度）---
+    if scale > 1:
+        scene = cv2.resize(scene, (size, size), interpolation=cv2.INTER_AREA)
+        centers = centers / scale
+
+    # --- 光谱：单色发射映射到 RGB 通道 ---
+    r_gain, g_gain, b_gain = wavelength_to_rgb(config.emission_nm)
+    bleed = config.spectral_bleed
+    gains = np.array([b_gain, g_gain, r_gain], dtype=np.float64)  # OpenCV BGR 顺序
+    gains = gains * (1.0 - bleed) + bleed * gains.mean()
+    gains = np.clip(gains, 0.0, None)
+    stack = scene[:, :, None] * gains[None, None, :]
+
+    image = apply_optics_and_sensor(stack, config, rng, size)
 
     # 浓度块：未启用浓度模式时各字段为 None，而不是省略键——下游消费者
     # 可以无条件取键并据此判断这张图有没有浓度标注。

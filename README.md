@@ -14,6 +14,10 @@ No application-specific background is required to use or review this repository.
 - `pg_benchmark.py`: seeded synthetic perturbation benchmark (7 perturbation families) with degradation-curve reports and A/B comparison.
 - `pg_benchmark_demo.py`: command-line benchmark runner and report comparator.
 - `pg_fluoro_sim.py`: physically-modelled fluorescence array simulator with ground truth — generates emission images (wavelength→RGB, per-well intensities, optics, sensor noise) and evaluates the pipeline against the known truth. `--concentration` drives emission from **absolute fluorophore concentration** through an inner-filter/self-quenching model, and `--dataset N` pools the results into a calibration dataset.
+- `pg_colori_sim.py`: transmission (colorimetric) array simulator with ground
+  truth — white EL backlight through a black mask, per-wavelength Beer-Lambert
+  absorption, paired blank image, and `A = -log10(I/I_blank)` evaluation.
+  Shares the geometry/optics/sensor chain with `pg_fluoro_sim`.
 - `pg_unit_export.py`: per-unit tight cropping — exports every array unit as an
   individual background-free PNG with a manifest and a contact-sheet
   verification image.
@@ -54,12 +58,28 @@ The current implementation follows this pipeline:
    contour (≈0.9–1.0) from a fragment carved out of the panel interior (≈0.5).
 2. Rectify the region into a canonical square view.
 3. Fit a physically constrained grid from blob candidates: black-hat enhanced
-   dark squares for 10x10, top-hat enhanced bright dots for 15x15. A small
-   angle sweep first estimates the residual lattice rotation left over after
-   rectification, the candidates are de-rotated, row/column clusters are
-   matched against a regular equally spaced axis model, and the resulting grid
-   is rotated back. Projection-peak fitting and the uniform physical grid stay
-   as fallbacks.
+   dark units, top-hat enhanced bright units, selected by the detected
+   polarity rather than by grid size. A small angle sweep first estimates the
+   residual lattice rotation left over after rectification, the candidates are
+   de-rotated, row/column clusters are matched against a regular equally
+   spaced axis model, and the resulting grid is rotated back. Projection-peak
+   fitting and the uniform physical grid stay as fallbacks.
+
+   The detectors' geometric gates and the axis pitch window are anchored to
+   the 15x15 reference and converted by unit pitch, because a unit's pixel
+   size tracks `side*(1-2*margin)/(grid_size-1)` rather than the canvas side.
+   Expressing them as fractions of the side silently encoded `grid_size ≈ 15`;
+   at 10x10 that rejected normal units for exceeding `max_area` and left the
+   axis pitch window with 3% headroom instead of 60%.
+
+   An axis whose clusters are incomplete is completed against the regular
+   lattice prior, tolerating up to half the rows or columns missing. Whole
+   dark rows are the norm rather than the exception for self-luminous arrays:
+   a log dilution series puts its dimmest wells below the substrate
+   autofluorescence floor, leaving 6 of 10 rows detectable at 10x10 and 9 of
+   15 at 15x15. When one axis resolves and the other does not, the resolved
+   axis supplies its pitch as a prior — a square array has the same pitch on
+   both axes, and rows going dark together leaves the column axis intact.
 4. Refine each local center with component-level constraints.
 5. Lattice bundle adjustment (V2.0): local refinement collects observations
    with real image evidence, an 8-DoF homography over `(row, col) -> (x, y)`
@@ -334,12 +354,18 @@ Measured on that command (8 images, 15×15, requested 1 nM–100 µM):
 
 Per-preset yield at 15×15, 3 images each: `ideal` 3/3, `typical` 3/3, `hard`
 3/3, `extreme` 2/3, with 1.3–3.7 %pitch localization error on the passing
-images. At **10×10** the `ideal` preset fails systematically instead (candidate
-support 0.03–0.10): razor-sharp synthetic squares with almost no defocus are
-harder for the blob detector than realistically blurred ones. That is
-pre-existing pipeline behavior on synthetic input, not a property of the
-concentration model, but it is why the dataset tests exercise 10×10 with
-`typical`/`hard`.
+images.
+
+**10×10 used to fail systematically here, and the explanation recorded in this
+file was wrong.** The symptom was that sharper scenes did worse than blurred
+ones — `ideal` (defocus 0.6) collapsed while `hard` (defocus 2.2) worked — and
+that was read as "razor-sharp synthetic squares are harder for the blob
+detector." The actual cause was a `max_area` ceiling that scaled with the
+canvas side instead of the unit pitch, so a normal 10×10 unit was rejected for
+being *too large*; defocus rescued the case by shrinking each unit's
+above-threshold core until it slipped back under the ceiling. Both detectors'
+gates are now anchored to the 15×15 reference and converted by unit pitch, and
+the `--sweep` numbers below are what the pipeline actually does.
 
 `plate_series` assigns one concentration per row (replicates within a row give
 the calibration curve its error bars) and **shuffles the row order**. Both
@@ -360,7 +386,68 @@ overall emission level down and reports where localization stops working. On
 the default 15×15 configuration the pipeline is reliable down to a peak of
 about 20 grey levels (support 0.71, localization 1.98 %pitch, rank fidelity
 0.989) and fails cleanly below roughly 10 grey levels — flagging
-`trusted=false` rather than returning a wrong grid.
+`trusted=false` rather than returning a wrong grid. 10×10 now holds the same
+envelope: 0.33–0.50 %pitch from 166 down to 41 grey levels, 1.82 %pitch with
+rank fidelity 0.987 at 20 grey levels, `trusted=false` from 10 grey levels
+down.
+
+The trust flag is fully correct on this scan — true for all four working
+levels, false for all five failing ones — which locates the false-alarm
+problem described below precisely: it appears only when a single image spans a
+wide intensity range. Scaling the whole array together keeps support at
+0.74–1.00, whereas a dilution series leaves a fixed fraction of wells under
+the floor and caps support near 0.55 regardless of how good the geometry is.
+
+### Localization accuracy baseline
+
+Mean localization error against the simulator's ground truth, from
+`python pg_fluoro_sim.py --grid {10,15} --output <dir> --sweep`:
+
+| preset | 10×10 | 15×15 |
+|---|---|---|
+| `ideal` | 1.46 %pitch | 2.00 %pitch |
+| `typical` | 2.71 %pitch | 4.19 %pitch |
+| `hard` | 3.96 %pitch | 103.50 %pitch |
+| `extreme` | 5.33 %pitch | 9.96 %pitch |
+
+Error is dominated by the wells that are physically invisible rather than by
+geometry: broken out by intensity decade, wells above 0.1 full-well localize to
+0.43–0.84 %pitch with rank fidelity ≥0.99, while wells in the 0.001–0.01 decade
+— at or below the substrate autofluorescence floor — contribute 2–14 %pitch.
+
+Two known defects remain, both visible in that table:
+
+- **15×15 `hard` is a whole-lattice one-pitch row shift.** Row *r* of the fitted
+  grid sits on ground-truth row *r+1*: the true top row is never claimed and a
+  phantom row is invented one pitch past the bottom edge. Comparing against
+  `truth[r+1][c]` collapses the residual from 103.50 to 4.93 %pitch, so the
+  geometry is right and only the index assignment is off. All three arbitration
+  signals are ratios over the shared rows, so none of them move — coverage and
+  support are bit-identical between the wrong grid and the corrected one. The
+  run does report `trusted=false`, so the never-fail-silently contract holds,
+  but it holds by luck rather than by detection.
+- **The trust flag cries wolf.** `candidate_support_ratio` is bounded above by
+  the fraction of wells that are physically visible; across the sweep and scan
+  runs it lands at a near-constant 0.71–0.75 of that fraction, and a log
+  dilution series leaves only ~0.72–0.77 of wells above the floor. Support
+  therefore settles around 0.52–0.57, just under the 0.6 gate, for runs that
+  localize to 1.5–4 %pitch. Measured on `examples/fluo/`, 8 of the 18 correctly
+  localized cases are flagged untrusted while all 6 genuine failures are caught
+  — no misses, but a 44% false-alarm rate.
+
+These interact, which fixes the order of work: the support gate cannot simply be
+lowered, because at 0.55 it cannot distinguish 10×10 `ideal` (1.46 %pitch) from
+15×15 `hard` (103.50 %pitch) — they report the same support. An evidence-based
+shift detector has to land first; only then can the gate be recalibrated
+without opening a silent-failure hole.
+
+A lattice-anisotropy test (row pitch versus column pitch, which the one-pitch
+shift distorts by 9.9%) was evaluated for that role and **rejected by
+measurement**: the real 10×10 photographs reach 0.08–0.11 anisotropy while
+localizing correctly, because connectors and channel lines pull the region box
+out of alignment with the array, and `partial_region_hard_0006` fails at
+123 %pitch with 0.0003 anisotropy because a pure translation preserves both
+pitches. No threshold separates the two populations.
 
 Self-luminous arrays have no continuous bright panel, so region detection
 degrades through two dedicated paths, ordered by how reliable their geometric
@@ -409,6 +496,97 @@ below the quantization floor, many dead wells), but such runs must report
 `trusted=false`. This matters because the candidate-support ratio is blind to
 whole-lattice shifts by an integer pitch — a grid displaced by exactly one
 pitch still has 14/15 of its points sitting on real wells.
+
+## Colorimetric Simulation with Ground Truth
+
+`pg_colori_sim.py` is the transmission counterpart of the fluorescence
+simulator, matching the v4.2 hardware's colorimetric mode: a white EL panel
+backlights the chip through a black PMMA mask (15×15 square apertures, 0.5 mm
+on a 1.0 mm pitch), and the phone photographs the array from above.
+
+Geometrically this looks like the fluorescence case — bright wells on a dark
+field, so the pipeline still detects `polarity=bright`. Physically it is the
+inverse: wells get **darker** with concentration, and the measured quantity is
+`A = -log10(I_sample / I_blank)` rather than an emission level. Everything
+downstream of scene radiance — geometry, defocus, vignetting, sensor noise,
+quantization — is shared with `pg_fluoro_sim` through `apply_optics_and_sensor`
+so the two modes cannot drift apart in what they claim about noise or SNR.
+
+```powershell
+python pg_colori_sim.py --grid 15 --output sim/c15 --evaluate
+python pg_colori_sim.py --grid 15 --output sim/csweep --sweep
+python pg_colori_sim.py --output . --linearity
+```
+
+Absorbance is integrated per wavelength rather than given a scalar `ε` per
+channel, because **Beer-Lambert does not commute with spectral integration**:
+
+```
+I_ch = ∫ S(λ)·R_ch(λ)·10^(−ε(λ)·c·l) dλ
+```
+
+A camera channel is tens of nanometres wide, so at high concentration the
+integral is dominated by the wavelengths where `ε` is *smallest*, and apparent
+absorbance bends away from linearity. This is the colorimetric analogue of the
+fluorescence inner-filter turnover, and it sets the upper end of the working
+range. A scalar-`ε` model produces a perfectly straight line and hides it.
+
+Because both a blank and a sample are needed, `write_colorimetric_sample`
+always emits a paired blank image rendered from the same seed — the fixed
+pattern noise then cancels in the ratio, exactly as it does on real hardware.
+
+### The 0.5 mm liquid layer sets the working range
+
+The chip is 20×20×0.5 mm, so the optical path is 0.5 mm — 20× shorter than a
+standard cuvette and 6× shorter than a microplate well. With TMB's acid
+endpoint (ε ≈ 5.9×10⁴ M⁻¹cm⁻¹ at 450 nm), measured on the blue channel:
+
+| Target | Concentration needed |
+|---|---|
+| A = 0.1 (practical floor) | 47 µM |
+| A = 1.0 | 471 µM |
+| A = 2.0 | 943 µM |
+
+Polychromatic compression is already 5% at A ≈ 0.4 (200 µM) and 22% at
+A ≈ 1.2 (700 µM), so the usefully linear range is roughly **25–200 µM**, with
+250–700 µM usable only against a non-linear calibration curve. Sub-µM
+colorimetric detection is not reachable with this chip geometry; the
+fluorescence mode's ~3 µM LOD is the better route for low concentrations.
+Path length is the single most effective lever if colorimetric sensitivity
+needs to improve.
+
+Measured on `--sweep` at 15×15:
+
+| preset | localization | A_B Spearman | blank A_B | trusted |
+|---|---|---|---|---|
+| `ideal` | 1.27 %pitch | 0.9995 | 0.0003 ± 0.0012 | true |
+| `typical` | 1.34 %pitch | 0.9995 | 0.0000 ± 0.0014 | true |
+| `hard` | 215.01 %pitch | −0.12 | — | **true (wrong)** |
+| `extreme` | 236.46 %pitch | 0.57 | — | false |
+
+Channel selectivity behaves as it should: for the yellow product the blue
+channel reaches A = 1.34 while red only reaches 0.047, so the readout carries
+colour information rather than just brightness.
+
+### Colorimetry makes the whole-lattice shift blind spot worse
+
+The `hard` row above is a silent failure — the contract violation the fluo
+regression set exists to prevent. It is the same defect documented earlier: an
+exhaustive integer-offset search shows that shifting the fitted grid by
+(−2 rows, −1 column) collapses the error from 215.01 to **1.82 %pitch**, so the
+geometry is right and only the index assignment is wrong.
+
+What is new is that colorimetry removes the accidental protection fluorescence
+had. A dilution series leaves a third of its wells under the detection floor,
+which drags `candidate_support_ratio` down to ~0.55 and trips the 0.6 gate more
+or less by luck. In transmission every well is visible — the span is only about
+20:1 — so a displaced grid still lands on real wells and all three signals stay
+high: support 0.80, coverage 0.83, observed 0.87. The run is reported as
+trusted.
+
+This raises the priority of the evidence-based shift detector: without it, the
+colorimetric mode can return a confidently wrong grid, and unlike the
+fluorescence case nothing else catches it.
 
 ## Perturbation Benchmark and A/B Comparison
 

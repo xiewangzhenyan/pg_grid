@@ -477,6 +477,7 @@ def measure_grid_coverage_ratio(
     pitch: float,
     scale_side: float | None = None,
     candidates: np.ndarray | None = None,
+    grid_size: int | None = None,
 ) -> float:
     """图中被检测到的单元有多大比例被网格覆盖。
 
@@ -499,7 +500,7 @@ def measure_grid_coverage_ratio(
         if polarity == "dark":
             candidates = _detect_dark_square_candidates(image, scale_side)
         else:
-            candidates = _detect_bright_dot_candidates(image, scale_side)
+            candidates = _detect_bright_dot_candidates(image, scale_side, grid_size=grid_size)
     candidates = np.asarray(candidates, dtype=np.float64)
     if candidates.shape[0] == 0:
         return 0.0
@@ -653,6 +654,33 @@ def _find_axis_centers(projection: np.ndarray, count: int, length: int, margin_r
     return centers
 
 
+# 斑点几何门限的参考规格：历史系数都是在 15x15 上调出来的。
+_GATE_REFERENCE_GRID = 15
+
+
+def _gate_reference_side(side: float, grid_size: int | None) -> float:
+    """把画幅边长换算成"等效 15x15 边长"，供几何门限沿用历史系数。
+
+    为什么按边长归一化是错的：单元的像素尺寸正比于**单元间距**
+    pitch = side*(1-2*margin)/(grid_size-1)，而不是正比于 side 本身。
+    历史公式（min_box=side*0.006、max_area=side²*0.0011 等）在 15x15 上
+    标定，因而隐含了 grid_size≈15 的假设。_default_rectified_size 给
+    10x10 用 800、给 15x15 用 1200，两者的单元同为约 34px，但按边长算出的
+    max_area 却是 704 与 1584——同样大的单元在 10x10 被判超限。实测（真值
+    矫正图、四个难度档）10x10 的 100 个孔只剩 19-24 个候选，且被拒的正是
+    最亮最可靠的那些（大斑点才会超上限）；15x15 则有 94-98 个。候选饥饿
+    会一路传导为晶格拟合失败、支撑率 0、区域仲裁失去区分度。
+
+    换算只需按 (grid-1) 反比缩放，因为 margin 与 side 都已在比值中约掉。
+    grid_size 为参考规格时返回 side 本身，故 15x15 的门限**逐值不变**，
+    这一恒等性由构造保证，而不依赖取整的巧合。
+    """
+
+    if not grid_size or grid_size < 2:
+        return float(side)
+    return float(side) * (_GATE_REFERENCE_GRID - 1) / float(grid_size - 1)
+
+
 def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | None = None) -> np.ndarray:
     """定位 10x10 暗色目标平面中的暗色方形反应区候选点。
 
@@ -714,12 +742,19 @@ def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | No
     return np.asarray(candidates, dtype=np.float32)
 
 
-def _detect_bright_dot_candidates(rectified: np.ndarray, scale_side: float | None = None) -> np.ndarray:
-    """定位 15x15 亮点阵列中的小亮斑候选点。
+def _detect_bright_dot_candidates(
+    rectified: np.ndarray,
+    scale_side: float | None = None,
+    grid_size: int | None = None,
+) -> np.ndarray:
+    """定位亮点阵列中的小亮斑候选点。
 
-    与 10x10 暗方块检测对偶：用顶帽变换（top-hat）增强“小而亮”的结构，
+    与暗方块检测对偶：用顶帽变换（top-hat）增强“小而亮”的结构，
     抑制面板亮度本身和大面积光照渐变，再用连通域几何过滤剔除
     面板边缘亮带、高光条等非点状结构。
+
+    几何门限按**单元间距**归一化（见 _gate_reference_side）。传入 grid_size
+    才能做换算；不传时退化为按边长归一化的历史公式，旧调用点行为不变。
 
     返回 N×3 数组：[x, y, weight]，weight 表示候选亮点的响应强度。
     """
@@ -727,9 +762,18 @@ def _detect_bright_dot_candidates(rectified: np.ndarray, scale_side: float | Non
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
     side = float(scale_side) if scale_side else min(width, height)
+    # 换算到等效 15x15 边长后，历史系数原样沿用。
+    gate_side = _gate_reference_side(side, grid_size)
+
+    kernel_size = max(25, int(gate_side * 0.050))
+    min_box = max(5, int(gate_side * 0.006))
+    # max_box 必须严格小于一个间距：它——而不是 max_area——才是挡住
+    # "两个相邻单元糊成一片"的那道门。
+    max_box = max(16, int(gate_side * 0.045))
+    min_area = max(20, int(gate_side * gate_side * 0.00004))
+    max_area = max(240, int(gate_side * gate_side * 0.00110))
 
     # 核尺寸要大于亮点直径，顶帽变换才会保留整个亮点而不是只留边缘。
-    kernel_size = max(25, int(side * 0.050))
     if kernel_size % 2 == 0:
         kernel_size += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
@@ -742,12 +786,6 @@ def _detect_bright_dot_candidates(rectified: np.ndarray, scale_side: float | Non
     interior = tophat[int(height * 0.10):int(height * 0.90), int(width * 0.10):int(width * 0.90)]
     if interior.size == 0:
         interior = tophat
-
-    # 亮点直径一般在矫正图边长的 0.8%-4.5% 之间；过大者多为高光带/边缘光晕。
-    min_box = max(5, int(side * 0.006))
-    max_box = max(16, int(side * 0.045))
-    min_area = max(20, int(side * side * 0.00004))
-    max_area = max(240, int(side * side * 0.00110))
 
     median = float(np.median(interior))
     mad = float(np.median(np.abs(interior - median)))
@@ -859,6 +897,41 @@ def _cluster_axis_candidates(values: np.ndarray, weights: np.ndarray, length: in
     return clusters
 
 
+def _expected_axis_pitch(length: float, count: int, margin_ratio: float = 0.085) -> float:
+    """轴向的名义单元间距，与 generate_grid_points 的排布约定一致。"""
+
+    return float(length) * (1.0 - 2.0 * float(margin_ratio)) / max(count - 1, 1)
+
+
+# 轴间距接受区间：历史值 [length*0.045, length*0.095] 换算成"相对名义
+# 间距的倍率"。在参考规格 15x15 上按构造逐值不变（expected 的 length 与
+# margin 因子恰好被约掉），其余规格继承同一套倍率。
+_AXIS_PITCH_MIN_RATIO = 0.045 * (_GATE_REFERENCE_GRID - 1) / (1.0 - 2.0 * 0.085)
+_AXIS_PITCH_MAX_RATIO = 0.095 * (_GATE_REFERENCE_GRID - 1) / (1.0 - 2.0 * 0.085)
+
+
+def _axis_pitch_bounds(length: float, count: int) -> tuple[float, float]:
+    """轴间距的接受区间，按**行列数**而不是画幅边长定义。
+
+    历史写法 [length*0.045, length*0.095] 与斑点门限犯的是同一个错误：
+    间距正比于 length/(count-1)，按 length 定区间就隐含了 count≈15。
+    实测 grid=10、length=800 时上界 76 相对名义间距 73.8 只剩 3% 余量，
+    而 grid=15 有 60%；主区域框稍一外扩，grid=10 的轴拟合就整体被拒、
+    退化到均分网格。
+
+    区间**不能**改成围绕名义间距对称：下界是防"压缩/互补晶格"的那道门，
+    而不是可有可无的余量。实测把 grid=15 的下界从 54 放到 44 后，
+    examples/fluo/gradient_failure_0034 立刻拟合出间距 44.4 的压缩晶格，
+    定位错 99.9%pitch 却因为压缩晶格照样落在真实孔上而拿到 0.91 支撑率、
+    被判 trusted=True——正是"绝不静默失败"契约要拦的情形。
+    因此这里沿用 15x15 已验证的非对称倍率：下界收紧防压缩，上界留出
+    区域框外扩的余量。
+    """
+
+    expected = _expected_axis_pitch(length, count)
+    return expected * _AXIS_PITCH_MIN_RATIO, expected * _AXIS_PITCH_MAX_RATIO
+
+
 def _fit_line_slope_intercept(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     """一次多项式（直线）的闭式最小二乘解，等价于 np.polyfit(x, y, deg=1)。
 
@@ -883,10 +956,11 @@ def _complete_axis_with_missing_clusters(
     clusters: list[tuple[float, float, int]],
     count: int,
     length: int,
+    pitch_prior: float | None = None,
 ) -> np.ndarray | None:
     """簇数不足 count 时，按间距锚定索引并外推缺失行/列。
 
-    整行/列单元被遮挡时对应的轴向簇会整体消失，但规则晶格先验让缺失
+    整行/列单元不可见时对应的轴向簇会整体消失，但规则晶格先验让缺失
     位置可推断：
     1. 用相邻簇距的中位数估计间距，把每个簇分配到整数晶格索引
        （中间缺口表现为间距跳变，索引随之跳跃）；
@@ -895,17 +969,33 @@ def _complete_axis_with_missing_clusters(
        网格在矫正图中近似居中，这是几何链路自带的物理先验；
     3. 对每个假设做与完整路径相同的间距/位置/残差校验。
 
-    最多容忍 2 个缺失簇：更多缺失时索引分配的错误风险迅速上升。
+    缺失上限取 count//2：自发光/荧光阵列的稀释序列里整行低于检测地板
+    是常态而非异常（实测 log 稀释序列 10x10 只有 6/10 行、15x15 只有
+    9/15 行可见，因为最暗的若干行整体低于基底自发荧光地板）。原先固定
+    上限 2 会让这类图直接放弃候选晶格路径、退到投影回退并给出错误网格。
+    放宽是安全的：几何约束（间距区间、起止位置、残差）本身就有很强的
+    消歧能力，实测上述各例通过约束的可行解都**唯一**，索引指派并无
+    二义性；真正无法消歧的图会因无解而返回 None，与放宽前行为一致。
+
+    pitch_prior 是另一坐标轴已确定的间距。方阵在方形矫正图中两轴间距
+    应当相等，因此另一轴成功时它是最强的可用先验：既能纠正"整段缺失
+    导致中位簇距是真实间距整数倍"的偏差，又能在评分中惩罚与之不符的解。
     """
 
     missing = count - len(clusters)
-    if not 1 <= missing <= 2 or len(clusters) < 3:
+    if not 1 <= missing <= max(2, count // 2) or len(clusters) < 3:
         return None
 
     centers = np.asarray(sorted(item[0] for item in clusters), dtype=np.float64)
     diffs = np.diff(centers)
     pitch_estimate = float(np.median(diffs))
-    if not length * 0.045 <= pitch_estimate <= length * 0.095:
+    if pitch_prior is not None and pitch_prior > 0.0:
+        # 观测簇若成段缺失，中位簇距会是真实间距的整数倍；先验能纠正它。
+        ratio = pitch_estimate / pitch_prior
+        if round(ratio) >= 1 and abs(ratio - round(ratio)) < 0.18:
+            pitch_estimate = float(pitch_prior)
+    axis_min_pitch, axis_max_pitch = _axis_pitch_bounds(length, count)
+    if not axis_min_pitch <= pitch_estimate <= axis_max_pitch:
         return None
 
     # 间距跳变 -> 索引跳跃（中间缺口）；累计得到相对索引。
@@ -919,7 +1009,7 @@ def _complete_axis_with_missing_clusters(
 
     best: tuple[float, np.ndarray] | None = None
     index_axis = np.arange(count, dtype=np.float64)
-    min_pitch, max_pitch = length * 0.045, length * 0.095
+    min_pitch, max_pitch = axis_min_pitch, axis_max_pitch
     min_start, max_start, max_end = length * 0.050, length * 0.300, length * 0.950
 
     for shift in range(count - span):
@@ -931,12 +1021,17 @@ def _complete_axis_with_missing_clusters(
         if fitted[0] < min_start or fitted[0] > max_start or fitted[-1] > max_end:
             continue
         residual = centers - (start + pitch * assigned)
-        if float(np.sqrt(np.mean(residual**2))) > length * 0.020:
+        rmse = float(np.sqrt(np.mean(residual**2)))
+        if rmse > length * 0.020:
             continue
-        # 边距对称性评分：越接近居中越可信。
+        # 评分：边距对称性为主（越接近居中越可信），叠加拟合残差；
+        # 另一轴给出间距先验时，与之偏离越大惩罚越重。
         asymmetry = abs(float(fitted[0]) - (length - float(fitted[-1])))
-        if best is None or asymmetry < best[0]:
-            best = (asymmetry, fitted.astype(np.float32))
+        score = asymmetry + rmse * 2.0
+        if pitch_prior is not None and pitch_prior > 0.0:
+            score += abs(pitch - float(pitch_prior)) / float(pitch_prior) * length * 0.5
+        if best is None or score < best[0]:
+            best = (score, fitted.astype(np.float32))
 
     return None if best is None else best[1]
 
@@ -945,16 +1040,18 @@ def _select_regular_axis_from_clusters(
     clusters: list[tuple[float, float, int]],
     count: int,
     length: int,
+    pitch_prior: float | None = None,
 ) -> np.ndarray | None:
     """从轴向簇中选择最符合规则晶格的一组中心。
 
     这里枚举 10 个候选簇的组合，并拟合 `start + pitch * i`。
     评分优先选择残差小、支持强、起止位置合理的组合。
-    簇数不足时转入缺失补全路径（整行/列被遮挡的场景）。
+    簇数不足时转入缺失补全路径（整行/列不可见或被遮挡的场景），
+    pitch_prior 为另一轴已确定的间距，见该函数说明。
     """
 
     if len(clusters) < count:
-        return _complete_axis_with_missing_clusters(clusters, count, length)
+        return _complete_axis_with_missing_clusters(clusters, count, length, pitch_prior)
 
     # 防组合爆炸：螺丝、边缘碎片可能产生大量杂散簇，簇数一多，
     # C(N, count) 会迅速失控（例如 C(24,10) 约 200 万组合，实测需要一分钟以上）。
@@ -971,8 +1068,7 @@ def _select_regular_axis_from_clusters(
 
     best: tuple[float, np.ndarray] | None = None
     index_axis = np.arange(count, dtype=np.float32)
-    min_pitch = length * 0.045
-    max_pitch = length * 0.095
+    min_pitch, max_pitch = _axis_pitch_bounds(length, count)
     # 起止范围只做弱约束（距边缘至少 5%）：主区域检测的外扩比例和形态学
     # 膨胀会让阵列在矫正图中的位置有 ±3% 左右浮动，过紧的范围会把
     # 合法网格误拒并退化为均分网格。假峰主要靠下面的规则性残差
@@ -1011,6 +1107,15 @@ def _select_regular_axis_from_clusters(
     return best[1]
 
 
+def _axis_pitch(axis: np.ndarray) -> float | None:
+    """已确定轴中心序列的间距（相邻差中位数）。"""
+
+    axis = np.asarray(axis, dtype=np.float64)
+    if axis.size < 2:
+        return None
+    return float(np.median(np.diff(axis)))
+
+
 def _fit_lattice_from_candidates(candidates: np.ndarray, grid_size: int, width: int, height: int) -> np.ndarray | None:
     """从候选点拟合带旋转补偿的规则晶格。
 
@@ -1037,6 +1142,18 @@ def _fit_lattice_from_candidates(candidates: np.ndarray, grid_size: int, width: 
     xs = _select_regular_axis_from_clusters(x_clusters, grid_size, width)
     ys = _select_regular_axis_from_clusters(y_clusters, grid_size, height)
 
+    # 一轴成功、另一轴失败时用前者的间距作先验重试。方阵在方形矫正图中
+    # 两轴间距应当相等，而两轴的可见性差异很大：稀释序列按行编排时整行
+    # 同时变暗，行轴（y）簇大量缺失，列轴（x）却因每列都含亮孔而完整。
+    if xs is not None and ys is None:
+        ys = _select_regular_axis_from_clusters(
+            y_clusters, grid_size, height, _axis_pitch(xs)
+        )
+    elif ys is not None and xs is None:
+        xs = _select_regular_axis_from_clusters(
+            x_clusters, grid_size, width, _axis_pitch(ys)
+        )
+
     if xs is None or ys is None:
         return None
 
@@ -1054,10 +1171,10 @@ def _fit_dark_square_grid(rectified: np.ndarray, grid_size: int) -> np.ndarray |
 
 
 def _fit_bright_dot_grid(rectified: np.ndarray, grid_size: int) -> np.ndarray | None:
-    """用亮点候选点拟合 15x15 规则网格。"""
+    """用亮点候选点拟合规则网格。"""
 
     height, width = rectified.shape[:2]
-    candidates = _detect_bright_dot_candidates(rectified)
+    candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
     return _fit_lattice_from_candidates(candidates, grid_size, width, height)
 
 
@@ -1298,7 +1415,7 @@ def _fit_grid_points_with_polarity(
 
     candidates_by_polarity = {
         "dark": _detect_dark_square_candidates(rectified),
-        "bright": _detect_bright_dot_candidates(rectified),
+        "bright": _detect_bright_dot_candidates(rectified, grid_size=grid_size),
     }
     order = _order_polarities_by_evidence(
         dark_count=candidates_by_polarity["dark"].shape[0],
@@ -1657,11 +1774,11 @@ def _candidate_support_ratio(
     if polarity == "dark":
         candidates = _detect_dark_square_candidates(rectified)
     elif polarity == "bright":
-        candidates = _detect_bright_dot_candidates(rectified)
+        candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
     elif grid_size == 10:
         candidates = _detect_dark_square_candidates(rectified)
     elif grid_size >= 15:
-        candidates = _detect_bright_dot_candidates(rectified)
+        candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
     else:
         return None, 0
 
@@ -2091,6 +2208,7 @@ def _cached_original_candidates(
     region: ChipRegion,
     rectified_size: int,
     cache: dict[str, np.ndarray],
+    grid_size: int | None = None,
 ) -> np.ndarray:
     """在原图坐标系检测单元候选，跨区域假设复用。
 
@@ -2121,7 +2239,7 @@ def _cached_original_candidates(
     if polarity == "dark":
         candidates = _detect_dark_square_candidates(small, span)
     else:
-        candidates = _detect_bright_dot_candidates(small, span)
+        candidates = _detect_bright_dot_candidates(small, span, grid_size=grid_size)
 
     candidates = np.asarray(candidates, dtype=np.float64)
     if candidates.shape[0] and scale < 1.0:
@@ -2164,9 +2282,12 @@ def _solve_with_region(
         refined.reshape(-1, 1, 2).astype(np.float32), inverse_matrix
     ).reshape(-1, 2).astype(np.float64)
     original_pitch = _median_lattice_pitch(projected, grid_size)
-    candidates = _cached_original_candidates(original, polarity, region, rectified_size, coverage_cache)
+    candidates = _cached_original_candidates(
+        original, polarity, region, rectified_size, coverage_cache, grid_size=grid_size
+    )
     coverage = measure_grid_coverage_ratio(
-        original, projected, polarity, max(original_pitch, 1.0), candidates=candidates,
+        original, projected, polarity, max(original_pitch, 1.0),
+        candidates=candidates, grid_size=grid_size,
     )
 
     support = lattice_info.get("candidate_support_ratio")
