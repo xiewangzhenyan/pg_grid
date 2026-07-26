@@ -80,7 +80,7 @@ def test_render_produces_bright_wells_on_dark_mask(tmp_path):
     """黑罩挡光、孔透光：孔内必须显著亮于罩体，极性为 bright。"""
     from pg_colori_sim import ColorimetricConfig, render_colorimetric_scene
 
-    config = ColorimetricConfig(grid_size=15, image_size=600, seed=3, layout="mask")
+    config = ColorimetricConfig(grid_size=15, image_size=600, seed=3, layout="masked")
     image, truth = render_colorimetric_scene(config)
 
     assert image.shape == (600, 600, 3)
@@ -97,7 +97,7 @@ def test_render_produces_bright_wells_on_dark_mask(tmp_path):
     assert float(np.median(well)) > float(np.median(gray)) * 1.5
 
 
-def test_substrate_layout_makes_spots_darker_than_substrate():
+def test_bare_layout_makes_spots_darker_than_substrate():
     """亮基底形态：反应区必须比基底**暗**，极性为 dark。
 
     这是实拍 15x15 芯片的真实样子（白色膜基底 + 深色反应点）。它与黑罩
@@ -107,7 +107,7 @@ def test_substrate_layout_makes_spots_darker_than_substrate():
     from pg_colori_sim import ColorimetricConfig, render_colorimetric_scene
 
     config = ColorimetricConfig(
-        grid_size=15, image_size=700, seed=4, layout="substrate",
+        grid_size=15, image_size=700, seed=4, layout="bare",
         concentration_pattern="uniform", concentration_max_uM=400.0,
         blank_well_count=0, el_honeycomb=0.0, substrate_texture=0.0,
     )
@@ -151,7 +151,7 @@ def test_write_sample_emits_paired_blank(tmp_path):
 
 
 @pytest.mark.parametrize("layout,expected_polarity",
-                         [("substrate", "dark"), ("mask", "bright")])
+                         [("bare", "dark"), ("masked", "bright")])
 def test_pipeline_localizes_colorimetric_image(tmp_path, layout, expected_polarity):
     """定位管线必须能处理**两种**比色版面，且极性判定正确。"""
     import cv2
@@ -186,3 +186,38 @@ def test_pipeline_localizes_colorimetric_image(tmp_path, layout, expected_polari
     error_pct = float(np.linalg.norm(predicted - mapped, axis=1).mean() / pitch * 100.0)
 
     assert error_pct < 10.0, f"比色图定位误差 {error_pct:.2f} %pitch"
+
+
+def test_leaky_mask_lifts_dark_field_toward_substrate():
+    """半透光罩体必须介于"理想黑罩"与"不装罩"之间，且单调过渡。
+
+    这是判断 PDMS 罩值不值得装的物理基础：罩体透过率是一个连续旋钮，
+    T→0 得到黑底亮孔，T→1 退化为不装罩。
+    """
+    from pg_colori_sim import ColorimetricConfig, render_colorimetric_scene
+
+    def field_level(transmittance: float) -> float:
+        config = ColorimetricConfig(
+            grid_size=15, image_size=600, seed=8, layout="masked",
+            mask_transmittance=transmittance,
+            concentration_pattern="uniform", concentration_max_uM=300.0,
+            blank_well_count=0, el_honeycomb=0.0, substrate_texture=0.0,
+            defocus_sigma_px=0.4, vignetting=0.0, illumination_nonuniformity=0.0,
+        )
+        image, _ = render_colorimetric_scene(config)
+        gray = image.mean(axis=2)
+        panel = gray[180:420, 180:420]
+        return float(np.percentile(panel, 20))    # 罩体（孔间）亮度
+
+    opaque, leaky, very_leaky = field_level(0.002), field_level(0.2), field_level(0.6)
+    assert opaque < leaky < very_leaky, f"罩体亮度非单调: {opaque}, {leaky}, {very_leaky}"
+
+
+def test_polarity_flip_absorbance_matches_mask_transmittance():
+    """极性翻转点 A = −log10(T_mask)：孔比罩体还暗时同图极性不再一致。"""
+    from pg_colori_sim import polarity_flip_absorbance
+
+    assert abs(polarity_flip_absorbance(0.01) - 2.0) < 1e-9
+    assert abs(polarity_flip_absorbance(0.1) - 1.0) < 1e-9
+    # 越透光越早翻转
+    assert polarity_flip_absorbance(0.3) < polarity_flip_absorbance(0.05)
