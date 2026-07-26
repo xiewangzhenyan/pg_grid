@@ -498,7 +498,7 @@ def measure_grid_coverage_ratio(
 
     if candidates is None:
         if polarity == "dark":
-            candidates = _detect_dark_square_candidates(image, scale_side)
+            candidates = _detect_dark_square_candidates(image, scale_side, grid_size=grid_size)
         else:
             candidates = _detect_bright_dot_candidates(image, scale_side, grid_size=grid_size)
     candidates = np.asarray(candidates, dtype=np.float64)
@@ -681,12 +681,29 @@ def _gate_reference_side(side: float, grid_size: int | None) -> float:
     return float(side) * (_GATE_REFERENCE_GRID - 1) / float(grid_size - 1)
 
 
-def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | None = None) -> np.ndarray:
-    """定位 10x10 暗色目标平面中的暗色方形反应区候选点。
+def _detect_dark_square_candidates(
+    rectified: np.ndarray,
+    scale_side: float | None = None,
+    grid_size: int | None = None,
+) -> np.ndarray:
+    """定位暗色单元（亮面板上的暗方块）候选点。
 
-    10x10 实拍图里的有效定位目标不是目标平面外框，而是每个通道上的灰色小方块。
-    这些小方块相对 均匀背景更暗，因此用黑帽变换（black-hat）增强“小而暗”的结构，
-    再通过连通域过滤掉螺丝孔、外框、划痕等非目标区域。
+    实拍图里的有效定位目标不是面板外框，而是每个通道上的灰色小方块。
+    这些小方块相对均匀背景更暗，因此用黑帽变换（black-hat）增强“小而暗”
+    的结构，再通过连通域过滤掉螺丝孔、外框、划痕等非目标区域。
+
+    几何门限**刻意保留按边长归一化的历史公式**，与亮点检测器不同。
+    亮点检测器只在 15x15 上标定过，所以换算到间距单位是纯收益；暗检测器
+    则在 10x10 与 15x15 的实拍图上都已验证，任何重新锚定都必然改动其中
+    一边。实测把它锚定到 15x15：grid=10 的 max_box 从 44 放宽到 68，
+    实拍板上的螺丝、连接器、通道线随之混入候选并带偏轴选择，支撑率从
+    0.88 塌到 0.37。因此这里不动公式。
+
+    唯一新增的是一条**安全钳制**：max_box 必须严格小于一个间距，因为它
+    才是挡住"两个相邻单元糊成一片"的那道门。按边长算出的 max_box/pitch
+    在 grid=10 是 0.60、grid=15 是 0.93，但 grid≥17 会超过 1.0，届时粘连
+    的两个单元会被当成一个候选。钳制在 10/15 上不生效（44<70、66<67.6），
+    只在更大规格上兜底。
 
     返回 N×3 数组：[x, y, weight]，weight 表示候选暗目标的响应强度。
     """
@@ -709,6 +726,9 @@ def _detect_dark_square_candidates(rectified: np.ndarray, scale_side: float | No
 
     min_box = max(8, int(side * 0.010))
     max_box = max(24, int(side * 0.055))
+    if grid_size:
+        # 兜底：粘连的两个单元必须被拒。已知 grid<=15 时本就满足，此处不改变行为。
+        max_box = min(max_box, int(_expected_axis_pitch(side, grid_size) * 0.95))
     min_area = max(50, int(side * side * 0.00012))
     max_area = max(450, int(side * side * 0.00120))
     edge_guard_x = width * 0.035
@@ -1166,7 +1186,7 @@ def _fit_dark_square_grid(rectified: np.ndarray, grid_size: int) -> np.ndarray |
     """用暗方块候选点拟合 10x10 规则网格。"""
 
     height, width = rectified.shape[:2]
-    candidates = _detect_dark_square_candidates(rectified)
+    candidates = _detect_dark_square_candidates(rectified, grid_size=grid_size)
     return _fit_lattice_from_candidates(candidates, grid_size, width, height)
 
 
@@ -1414,7 +1434,7 @@ def _fit_grid_points_with_polarity(
     hint_strength, hint = _polarity_hint_with_strength(gray)
 
     candidates_by_polarity = {
-        "dark": _detect_dark_square_candidates(rectified),
+        "dark": _detect_dark_square_candidates(rectified, grid_size=grid_size),
         "bright": _detect_bright_dot_candidates(rectified, grid_size=grid_size),
     }
     order = _order_polarities_by_evidence(
@@ -1772,11 +1792,11 @@ def _candidate_support_ratio(
     # 极性已知时按极性选检测器（任意网格规格都可校验）；
     # 未知时沿用旧的按规格映射，保证向后兼容。
     if polarity == "dark":
-        candidates = _detect_dark_square_candidates(rectified)
+        candidates = _detect_dark_square_candidates(rectified, grid_size=grid_size)
     elif polarity == "bright":
         candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
     elif grid_size == 10:
-        candidates = _detect_dark_square_candidates(rectified)
+        candidates = _detect_dark_square_candidates(rectified, grid_size=grid_size)
     elif grid_size >= 15:
         candidates = _detect_bright_dot_candidates(rectified, grid_size=grid_size)
     else:
@@ -2237,7 +2257,7 @@ def _cached_original_candidates(
     xs, ys = region.points[:, 0], region.points[:, 1]
     span = max(float(xs.max() - xs.min()), float(ys.max() - ys.min()), 1.0) * scale
     if polarity == "dark":
-        candidates = _detect_dark_square_candidates(small, span)
+        candidates = _detect_dark_square_candidates(small, span, grid_size=grid_size)
     else:
         candidates = _detect_bright_dot_candidates(small, span, grid_size=grid_size)
 
