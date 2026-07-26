@@ -324,6 +324,15 @@ class ColorimetricConfig:
     plasmon: PlasmonResonance = field(default_factory=PlasmonResonance)
     ratio_pair: str = "RG"            # 比值读数用哪两个通道
 
+    # 金纳米阵列本身的消光。它**始终存在**，与显色产物是叠加关系而不是
+    # 二选一：光先穿过金阵列，再穿过沉积在其上的显色产物。
+    #   T_斑点 = T_金 × T_显色产物(c)
+    # 对定量的影响：金的消光在样品图和空白图里完全相同，取比值时精确
+    # 对消，因此**不会引入偏差**——它只是让整体透过率变低、光子数变少，
+    # 代价体现在信噪比而不是准确度上。
+    # 设为 None 表示无金阵列（普通显色芯片）。
+    array_plasmon: PlasmonResonance | None = None
+
     # 参考列：该列只通缓冲液、不加抗原，作为同帧空间参考。
     # 交叉通道版型（横向加抗体、纵向加抗原）让这件事几乎免费——牺牲
     # 15/225 = 6.7% 通量，换来照明漂移、曝光波动、温度、行间基线差异
@@ -546,6 +555,13 @@ def render_colorimetric_scene(
     else:
         transmittance = concentration_to_channel_transmittance(concentrations, config.chromophore)
         peak_shift = None
+        if config.array_plasmon is not None:
+            # 金阵列的消光叠加在显色产物之上：光先穿金，再穿产物。
+            # 空白图里金的消光完全相同，故取比值时对消，不引入偏差。
+            gold, _ = plasmon_channel_transmittance(
+                np.zeros_like(concentrations), config.array_plasmon
+            )
+            transmittance = transmittance * gold
 
     scene, centers = _render_transmission_map(config, transmittance, canvas, rng)
 

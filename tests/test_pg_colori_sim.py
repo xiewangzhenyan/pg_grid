@@ -328,3 +328,36 @@ def test_plasmon_scene_renders_and_carries_shift_truth(tmp_path):
     shift = np.asarray(truth["peak_shift_nm"]).reshape(15, 15)
     assert np.all(shift[:, 0] == 0.0), "参考列峰移应为零"
     assert shift.max() > 0.0
+
+
+def test_gold_array_extinction_cancels_in_the_absorbance_ratio():
+    """金阵列的消光必须在 A=−log10(I/I_blank) 中精确对消。
+
+    这是"金纳米芯片上能不能做酶显色定量"的关键：金让整体透过率下降，
+    但它在样品图和空白图里完全相同，取比值时消掉，因此不引入偏差——
+    代价只体现在信噪比（光子变少），不体现在准确度。
+    """
+    from pg_colori_sim import (ColorimetricConfig, PlasmonResonance,
+                               render_colorimetric_scene)
+
+    base = dict(grid_size=15, image_size=400, layout="bare",
+                concentration_pattern="log_series", concentration_min_uM=50.0,
+                concentration_max_uM=800.0, concentration_jitter=0.0,
+                blank_well_count=0, seed=3)
+
+    def absorbance(array_plasmon):
+        config = ColorimetricConfig(**base, array_plasmon=array_plasmon)
+        _, sample = render_colorimetric_scene(config, force_blank=False)
+        _, blank = render_colorimetric_scene(config, force_blank=True)
+        t_s = np.asarray(sample["transmittance_rgb"])
+        t_b = np.asarray(blank["transmittance_rgb"])
+        return -np.log10(np.clip(t_s, 1e-12, None) / np.clip(t_b, 1e-12, None)), t_b
+
+    gold = PlasmonResonance(peak_nm=630.0, fwhm_nm=110.0, extinction_depth=0.45)
+    a_plain, blank_plain = absorbance(None)
+    a_gold, blank_gold = absorbance(gold)
+
+    # 金确实压低了整体透过率
+    assert blank_gold[0, 2] < blank_plain[0, 2] * 0.99
+    # 但吸光度逐点完全一致
+    assert np.allclose(a_plain, a_gold, atol=1e-9), "金阵列在吸光度比值中未对消"
